@@ -936,6 +936,10 @@ class DelayME(object):
 
             rxn_conc = dme.reactions.get_by_id('abundance_%s' % cplx.id)
             rxn_conc.add_metabolites({cons_delay:1}, combine=False)
+            # need to relax the bounds on abundance_cplx variables
+            # since we move the prior abundance into the constraint rhs now. 
+            rxn_conc.lower_bound = 0.
+            rxn_conc.upper_bound = 1000.
 
         return dme
 
@@ -1078,7 +1082,7 @@ class DelayME(object):
     def update_cplx_concs(self, cplx_conc_dict):
         """
         Update complex concentrations in the constraints.
-        Can do this directly, too, but have this for convenience.
+        (Different from MMmodel, which changes variable bounds.)
         """
         mm = self.mod_me
         for cplx_id,conc in iteritems(cplx_conc_dict):
@@ -1120,9 +1124,9 @@ class MMmodel(object):
         solver = ME_NLP1(mm, growth_key=growth_key)
         return solver
 
-    def update_cplx_concs(self, cplx_conc_dict):
+    def update_cplx_bounds(self, cplx_conc_dict):
         """
-        Update complex concentrations in the constraints.
+        Update complex concentration bounds.
         Can do this directly, too, but have this for convenience.
         """
         mm = self.mod_me
@@ -1676,7 +1680,9 @@ class DelayedDynamicME(object):
                        verbosity=2,
                        solver_verbosity=0,
                        LB_DEFAULT=-1000.,
-                       UB_DEFAULT=1000.):
+                       UB_DEFAULT=1000.,
+                       MU_MIN=0.,
+                       MU_MAX=2):
         """
         result = simulate_batch()
 
@@ -1835,7 +1841,8 @@ class DelayedDynamicME(object):
                     if no_nlp:
                         mu_opt, hs_bs, x_opt, cache_opt = delay_solver.bisectmu(
                                 prec_bs, basis=basis,
-                                mumin=mu_feas*0.999, mumax=10*mu_feas,
+                                #mumin=mu_feas*0.999, mumax=10*mu_feas,
+                                mumin=MU_MIN, mumax=MU_MAX,
                                 verbosity=solver_verbosity)
                     else:
                         x_opt, stat, hs_bs = delay_solver.solvenlp(prec_bs, basis=basis)
@@ -1847,7 +1854,8 @@ class DelayedDynamicME(object):
                 else:
                     mu_opt, hs_bs, x_opt, cache_opt = delay_solver.bisectmu(
                             prec_bs, basis=basis,
-                            mumin=mu_feas*0.999, mumax=10*mu_feas,
+                            #mumin=mu_feas*0.999, mumax=10*mu_feas,
+                            mumin=MU_MIN, mumax=MU_MAX,
                             verbosity=solver_verbosity)
 
                 basis = hs_bs
