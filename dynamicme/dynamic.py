@@ -457,14 +457,54 @@ class DynamicME(object):
 
 
 
-    def simulate_fedbatch(self):
+    def simulate_fed_batch(self, T, c0_dict, X0, cplx_conc_dict0,
+                       feed_schedule,
+                       dt=0.1, H=None,
+                       o2_e_id='o2_e', o2_head=0.21, kLa=7.5,
+                       conc_dep_fluxes = False,
+                       extra_rxns_tracked=[],
+                       prec_bs=1e-6,
+                       ZERO_CONC = 1e-3,
+                       lb_dict={},
+                       ub_dict={},
+                       proteome_has_inertia=True,
+                       mm_model = None,
+                       basis=None,
+                       no_nlp=False,
+                       verbosity=2,
+                       solver_verbosity=0,
+                       LB_DEFAULT=-1000.,
+                       UB_DEFAULT=1000.,
+                       MU_MIN=0.,
+                       MU_MAX=2):
         """
-        Solve dynamic ME problem
-        T:      batch time
-        c_ex0:  initial extracellular concentrations
-        X0:     initial biomass density
-        Ft:     feed profile over time
-        V0:     initial medium volume 
+        result = simulate_fed_batch()
+
+        Solve dynamic ME problem with proteome delay
+        [Arguments]
+        T:  batch time
+        c0_dict: initial extracellular concentration dict
+        X0: initial biomass density
+        feed_schedule: feed schedule (amount added),
+            dict = {time: {met: {'conc':concentration, 'vol':volume}}}
+        o2_e_id: oxygen (extracellular) metabolite ID
+        o2_head: headspace O2 concentration
+        kLa: mass transfer coefficient for O2
+        dt: time step (h)
+        H:  prediction horizon. Default=None. In which case, sets equal to dt
+        conc_dep_fluxes: are uptake fluxes concentration dependent?
+        prec_bs: precision of mu for bisection
+        ZERO_CONC: (in mM) if below this concentration, consider depleted
+        proteome_has_inertia: if True, track protein concentrations and
+                              constrain catalyzed flux (default: False)
+        cplx_conc_dict0: (initial) protein concentration dict.
+                        Only the complexes in this dict will be constrained for
+                        the rest of the simulation.
+        mm_model : the metabolism and macromolecule model used to implement
+                   proteome inertia constraints
+
+        [Output]
+        result
         """
 
 
