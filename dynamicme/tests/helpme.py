@@ -23,8 +23,7 @@ class HelpME(object):
     """
     Used to quickly solve tiny ME including warm-starts.
     """
-    def __init__(self, model_path=None, prototyping=True, dynamic=False, observed=False,
-            fully_loaded=False):
+    def __init__(self, model_path=None, prototyping=True, protease=False):
         # Load the (default) test model
         if model_path is None:
             home = os.path.expanduser('~')
@@ -33,9 +32,14 @@ class HelpME(object):
                 basisfile = None
                 solverfile  = os.path.join(home,'ME','models','solver_tinyME_nostress_v1.pickle')
             else:
-                filename = os.path.join(home,'ME','models','iLE_nostress.pickle')
-                basisfile = None
-                solverfile  = os.path.join(home,'ME','models','solver_iLE_nostress.pickle')
+                if protease:
+                    filename = os.path.join(home,'ME','models','iLE_protdegr.pickle')
+                    basisfile = None
+                    solverfile  = os.path.join(home,'ME','models','solver_iLE_protdegr.pickle')
+                else:
+                    filename = os.path.join(home,'ME','models','iLE_nostress.pickle')
+                    basisfile = None
+                    solverfile  = os.path.join(home,'ME','models','solver_iLE_nostress.pickle')
 
         else:
             filename = model_path
