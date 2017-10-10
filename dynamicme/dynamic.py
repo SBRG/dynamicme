@@ -22,6 +22,7 @@ from cobrame import mu
 from cobrame import Constraint
 from cobrame import MetabolicReaction, TranslationReaction, MEReaction
 from cobrame import MEModel
+from cobrame import Complex, ComplexFormation, GenericFormationReaction
 
 from qminos.qnonlinme import ME_NLP
 from qminos.me1 import ME_NLP1
@@ -943,7 +944,9 @@ class DelayME(object):
         mam = MMmodel(me_solver, cplx_conc_dict, self.growth_key, self.growth_rxn)
         dme = mam.mm
         # Now, just add additional constraints and rxns
-        for data in dme.complex_data:
+        #for data in dme.complex_data:
+        for dataid in cplx_conc_dict.keys():
+            data = dme.complex_data.get_by_id(dataid)
             cplx = data.complex
             #------------------------------------------------
             # Can make more or less complex for next timestep
@@ -1011,7 +1014,9 @@ class DelayME(object):
 
             cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn)
 
-        for data in dme.complex_data:
+        #for data in dme.complex_data:
+        for dataid in cplx_conc_dict.keys():
+            data = dme.complex_data.get_by_id(dataid)
             cplx = data.complex
             #------------------------------------------------
             # Create reaction to track accum/depletion of enzyme E
@@ -2110,10 +2115,13 @@ def get_exchange_rxn(me, metid, direction='both', exchange_one_rxn=None):
     return ex_rxn
 
 
-def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', ZERO=1e-20):
+def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', undiluted_cplxs=None,
+        ZERO=1e-20):
     """
     Get complex concentrations (mmol/gDW) from solution:
     [E_i] = sum_j v_j / keff_ij
+
+    undiluted_cplxs: skip the complexes that are not diluted--i.e.,. treated as metabolites
     """
     me = solver.me
     x_dict = me.solution.x_dict
@@ -2121,9 +2129,25 @@ def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', ZERO=1e-20
         #muopt = solver.substitution_dict['mu']
         muopt = x_dict[growth_rxn]
 
+    if undiluted_cplxs is None:
+        undiluted_cplxs = []
+        for data in me.complex_data:
+            met = data.complex
+            for rxn in met.reactions:
+                if not isinstance(rxn,ComplexFormation) and \
+                    not isinstance(rxn,GenericFormationReaction):
+                    try:
+                        if rxn.metabolites[met]<0:
+                            if not hasattr(rxn.metabolites[met],'subs'):
+                                undiluted_cplxs.append(data)
+                    except TypeError:
+                        continue
+
+        undiluted_cplxs = list(set(undiluted_cplxs))
+
     solver.substitution_dict['mu'] = muopt
     sub_vals = [solver.substitution_dict[k] for k in solver.subs_keys_ordered]
-    cplxs = [data.complex for data in me.complex_data]
+    cplxs = [data.complex for data in me.complex_data if data not in undiluted_cplxs]
 
     cplx_conc_dict = {}
     for cplx in cplxs:
