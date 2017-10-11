@@ -1934,6 +1934,7 @@ class DelayedDynamicME(object):
             cplx_conc_dict_prime = cplx_conc_dict.copy()
             #------------------------------------------------
 
+
             #================================================
             # Determine if smaller timestep needed to prevent
             # concentration of metabolite or complex < 0
@@ -1941,6 +1942,9 @@ class DelayedDynamicME(object):
             # checked and the final timestep decided.
             #================================================
             dt_new = dt     # If need to change timestep
+            # Get biomass at next timestep assuming default timestep used
+            X_biomass_prime = X_biomass + mu_opt*X_biomass*dt_new
+            X_biomass_trpzd = (X_biomass + X_biomass_prime)/2
             """
             for a cell:
                 Ej(t+1) = Ej(t) + v_formation*dt
@@ -1988,12 +1992,12 @@ class DelayedDynamicME(object):
                 if metid is not o2_e_id:
                     # Update concentration for next timestep
                     # mmol/L = mmol/gDW/h * gDW/L * h
-                    conc_new = conc + v*X_biomass_prime*dt_new
+                    conc_new = conc + v*X_biomass_trpzd*dt_new
                     if conc_new < (ZERO_CONC - prec_bs):
                         if v < -ZERO:
                             # If multiple concentrations below 0,
                             # need to take the smallest timestep.
-                            dt_new = min(dt_new, -conc / (v*X_biomass_prime))
+                            dt_new = min(dt_new, -conc / (v*X_biomass_trpzd))
 
             #------------------------------------------------
             # Actually update complex concentrations for next time step
@@ -2047,13 +2051,13 @@ class DelayedDynamicME(object):
                 if metid is not o2_e_id:
                     # Update concentration for next timestep
                     # mmol/L = mmol/gDW/h * gDW/L * h
-                    conc_new = conc + v*X_biomass_prime*dt_new
+                    conc_new = conc + v*X_biomass_trpzd*dt_new
                     conc_dict_prime[metid] = conc_new
                 else:
                     # Account for oxygen diffusion from headspace into medium
-                    conc_dict_prime[metid] = conc+(v*X_biomass_prime + kLa*(o2_head - conc))*dt_new
+                    conc_dict_prime[metid] = conc+(v*X_biomass_trpzd + kLa*(o2_head - conc))*dt_new
 
-            # Actually update biomass using smallest required timestep.
+            # Actually update biomass for next timepoint using smallest required timestep.
             X_biomass_prime = X_biomass + mu_opt*X_biomass*dt_new
 
             #------------------------------------------------
