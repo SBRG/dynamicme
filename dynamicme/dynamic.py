@@ -1739,7 +1739,7 @@ class DelayedDynamicME(object):
                        MU_MIN=0.,
                        MU_MAX=2,
                        handle_negative_conc='timestep',
-                       ZERO_FLUX=1e-15):
+                       ZERO=1e-15):
         """
         result = simulate_batch()
 
@@ -1928,17 +1928,19 @@ class DelayedDynamicME(object):
                     x_dict = dme.solution.x_dict
 
             #------------------------------------------------
-            # Update biomass for next time step
-            X_biomass_prime = X_biomass + mu_opt*X_biomass*dt
             # Update concentrations
             ex_flux_dict = {}
             conc_dict_prime = conc_dict.copy()
             cplx_conc_dict_prime = cplx_conc_dict.copy()
             #------------------------------------------------
 
-            #------------------------------------------------
-            # Update complex concentrations for next time step
-            #------------------------------------------------
+            #================================================
+            # Determine if smaller timestep needed to prevent
+            # concentration of metabolite or complex < 0
+            # Update actual concentration after all concentrations
+            # checked and the final timestep decided.
+            #================================================
+            dt_new = dt     # If need to change timestep
             """
             for a cell:
                 Ej(t+1) = Ej(t) + v_formation*dt
@@ -1951,17 +1953,71 @@ class DelayedDynamicME(object):
                 try:
                     v_dedt = dme.solution.x_dict[dedt.id]
                 except:
-                    pass
-                cplx_conc_dict_prime[cplx_id] = conc + v_dedt*dt
+                    continue
+                conc_new = conc + v_dedt*dt_new
+                if conc_new < -ZERO:
+                    if v_dedt < -ZERO:
+                        dt_new = min(dt_new, -conc/v_dedt)
+
+            #------------------------------------------------
+            # Determine if smaller timestep needed for metabolite concentrations
+            #------------------------------------------------
+            for metid, conc in conc_dict.iteritems():
+                v = 0.
+                # If cobrame, exchange fluxes are just one -1000 <= EX_... <= 1000, etc.
+                if exchange_one_rxn:
+                    rxn = get_exchange_rxn(dme, metid)
+                    if x_dict is not None:
+                        v = dme.solution.x_dict[rxn.id]              # mmol/gDW/h
+                # If ME 1.0, EX_ split into source and sink
+                else:
+                    v_in  = 0.
+                    v_out = 0.
+                    try:
+                        rxn_in  = get_exchange_rxn(dme, metid, 'source', exchange_one_rxn)
+                        v_in  = dme.solution.x_dict[rxn_in.id]
+                    except:
+                        pass
+                    try:
+                        rxn_out = get_exchange_rxn(dme, metid, 'sink', exchange_one_rxn)
+                        v_out = dme.solution.x_dict[rxn_out.id]
+                    except:
+                        pass
+                    v = v_out - v_in
+
+                if metid is not o2_e_id:
+                    # Update concentration for next timestep
+                    # mmol/L = mmol/gDW/h * gDW/L * h
+                    conc_new = conc + v*X_biomass_prime*dt_new
+                    if conc_new < (ZERO_CONC - prec_bs):
+                        if v < -ZERO:
+                            # If multiple concentrations below 0,
+                            # need to take the smallest timestep.
+                            dt_new = min(dt_new, -conc / (v*X_biomass_prime))
+
+            #------------------------------------------------
+            # Actually update complex concentrations for next time step
+            # using smallest required timestep.
+            #------------------------------------------------
+            if verbosity >= 1:
+                if dt_new != dt:
+                    print 'Changed timestep to %g' % (dt_new)
+
+            for cplx_id, conc in iteritems(cplx_conc_dict):
+                cplx = dme.metabolites.get_by_id(cplx_id)
+                dedt = dme.reactions.get_by_id('dedt_'+cplx_id)
+                v_dedt = 0.
+                try:
+                    v_dedt = dme.solution.x_dict[dedt.id]
+                except:
+                    continue
+                conc_new = conc + v_dedt*dt_new
+                cplx_conc_dict_prime[cplx_id] = conc_new
 
             delay_model.update_cplx_concs(cplx_conc_dict_prime)
-
             #------------------------------------------------
-            # Update metabolite concentrations for next time step
+            # Actually update metabolite concentrations using smallest required timestep.
             #------------------------------------------------
-            reset_run = False
-            dt_new = dt     # If need to change timestep
-
             for metid, conc in conc_dict.iteritems():
                 v = 0.
                 # If cobrame, exchange fluxes are just one -1000 <= EX_... <= 1000, etc.
@@ -1978,59 +2034,33 @@ class DelayedDynamicME(object):
                         rxn_in  = get_exchange_rxn(dme, metid, 'source', exchange_one_rxn)
                         v_in  = dme.solution.x_dict[rxn_in.id]
                         ex_flux_dict[rxn_in.id] = v_in
-                    except:
-                        pass
+                    except Exception:
+                        continue
                     try:
                         rxn_out = get_exchange_rxn(dme, metid, 'sink', exchange_one_rxn)
                         v_out = dme.solution.x_dict[rxn_out.id]
                         ex_flux_dict[rxn_out.id] = v_out
-                    except:
-                        pass
+                    except Exception:
+                        continue
                     v = v_out - v_in
 
                 if metid is not o2_e_id:
                     # Update concentration for next timestep
-                    conc_dict_prime[metid] = conc + v*X_biomass_prime*dt_new
                     # mmol/L = mmol/gDW/h * gDW/L * h
-                    if conc_dict_prime[metid] < (ZERO_CONC - prec_bs):
-                        if handle_negative_conc == 'throttle':
-                            # if 'throttle'
-                            # Set flag to negate this run and recompute fluxes 
-                            # again with a new lower bound if any of the
-                            # metabolites end up with a negative concentration
-                            if verbosity >= 1:
-                                print metid, "below threshold, reset run flag triggered"
-                            reset_run = True
-                            lb_dict[rxn.id] = min(-conc_dict[metid]/(X_biomass_prime * dt_new),0.)
-                            if verbosity >= 1:
-                                print 'Changing lower bounds %s to %.3f' % (metid, lb_dict[rxn.id])
-                        elif handle_negative_conc == 'timestep':
-                            if v < -ZERO_FLUX:
-                                dt_new = -conc / (v*X_biomass_prime)
-                                if verbosity >= 1:
-                                    print 'Changed timestep to %g' % (dt_new)
-                                #--------------------------------
-                                # Update all variables with the new timestep 
-                                conc_dict_prime[metid] = conc + v*X_biomass_prime*dt_new
-                                X_biomass_prime = X_biomass + mu_opt*X_biomass*dt_new
-                                cplx_conc_dict_prime[cplx_id] = conc + v_dedt*dt_new
-                                #--------------------------------
-                        else:
-                            conc_dict_prime[metid] = 0.
+                    conc_new = conc + v*X_biomass_prime*dt_new
+                    conc_dict_prime[metid] = conc_new
                 else:
                     # Account for oxygen diffusion from headspace into medium
                     conc_dict_prime[metid] = conc+(v*X_biomass_prime + kLa*(o2_head - conc))*dt_new
 
+            # Actually update biomass using smallest required timestep.
+            X_biomass_prime = X_biomass + mu_opt*X_biomass*dt_new
 
-            # Reset the run if the reset_run flag is triggered, if not update the new biomass and conc_dict
-            if reset_run:
-                if verbosity >= 1:
-                    print "Resetting run"
-                continue  # Skip the updating of time steps and go to the next loop while on the same time step
-            else:
-                X_biomass = X_biomass_prime
-                conc_dict = conc_dict_prime.copy()
-                cplx_conc_dict = cplx_conc_dict_prime.copy()
+            #------------------------------------------------
+            # Copy updated values to be the previous values
+            X_biomass = X_biomass_prime
+            conc_dict = conc_dict_prime.copy()
+            cplx_conc_dict = cplx_conc_dict_prime.copy()
 
             ### Extra fluxes tracked
             for rxn in extra_rxns_tracked:
@@ -2052,14 +2082,6 @@ class DelayedDynamicME(object):
             mu_profile.append(mu_opt)
             # Save protein concentrations
             cplx_profile.append(cplx_conc_dict.copy())
-
-            # Reset recompute_fluxes to false
-            # recompute_fluxes = False
-            #if mu_opt < prec_bs:
-            #    recompute_fluxes = False
-            ## If turned infeasible, we're probably done
-            if dme.solution is None:
-                recompute_fluxes = False
 
             # ------------------------------------------------
             # Print some results
