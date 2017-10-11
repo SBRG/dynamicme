@@ -27,6 +27,8 @@ from cobrame import Complex, ComplexFormation, GenericFormationReaction
 from qminos.qnonlinme import ME_NLP
 from qminos.me1 import ME_NLP1
 
+from dynamicme.model import ComplexDegradation, PeptideDegradation
+
 from cobrawe.me1tools import ME1tools
 from sympy import Basic
 
@@ -113,7 +115,8 @@ class DynamicME(object):
                        no_nlp=False,
                        verbosity=2,
                        LB_DEFAULT=-1000.,
-                       UB_DEFAULT=1000.):
+                       UB_DEFAULT=1000.,
+                       throttle_near_zero=True):
         """
         result = simulate_batch()
 
@@ -326,20 +329,21 @@ class DynamicME(object):
 
                 if metid is not o2_e_id:
                     conc_dict_prime[metid] = conc + v*X_biomass_prime*dt    # mmol/L = mmol/gDW/h * gDW/L * h
-                    if conc_dict_prime[metid] < (ZERO_CONC - prec_bs):
-                        # Set flag to negate this run and recompute fluxes again with a new lower bound if any of the
-                        # metabolites end up with a negative concentration
-                        if verbosity >= 1:
-                            print metid, "below threshold, reset run flag triggered"
-                        reset_run = True
-                        lb_dict[rxn.id] = min(-conc_dict[metid] / (X_biomass_prime * dt), 0.)
-                        if verbosity >= 1:
-                            print 'Changing lower bounds %s to %.3f' % (metid, lb_dict[rxn.id])
-                    elif -v*X_biomass_prime*dt > conc_dict_prime[metid]/2:
-                        ### Update lower bounds as concentration is nearing 0
-                        lb_dict[rxn.id] = min(-conc_dict_prime[metid]/(X_biomass*dt), 0.)
-                        if verbosity >= 1:
-                            print 'Changing lower bounds %s to %.3f' %(metid, lb_dict[rxn.id])
+                    if throttle_near_zero:
+                        if conc_dict_prime[metid] < (ZERO_CONC - prec_bs):
+                            # Set flag to negate this run and recompute fluxes again with a new lower bound if any of the
+                            # metabolites end up with a negative concentration
+                            if verbosity >= 1:
+                                print metid, "below threshold, reset run flag triggered"
+                            reset_run = True
+                            lb_dict[rxn.id] = min(-conc_dict[metid] / (X_biomass_prime * dt), 0.)
+                            if verbosity >= 1:
+                                print 'Changing lower bounds %s to %.3f' % (metid, lb_dict[rxn.id])
+                        elif -v*X_biomass_prime*dt > conc_dict_prime[metid]/2:
+                            ### Update lower bounds as concentration is nearing 0
+                            lb_dict[rxn.id] = min(-conc_dict_prime[metid]/(X_biomass*dt), 0.)
+                            if verbosity >= 1:
+                                print 'Changing lower bounds %s to %.3f' %(metid, lb_dict[rxn.id])
                 else:
                     # Account for oxygen diffusion from headspace into medium
                     conc_dict_prime[metid] = conc + (v*X_biomass_prime + kLa*(o2_head - conc))*dt
@@ -901,7 +905,8 @@ class DelayME(object):
     decrease (dilution, degradation) of complexes.
     """
     def __init__(self, solver, dt, cplx_conc_dict=None,
-            growth_key='mu', growth_rxn='biomass_dilution'):
+            growth_key='mu', growth_rxn='biomass_dilution',
+            undiluted_cplxs=[]):
         #super(DelayME, self).__init__(*args, **kwargs)
         self.me_solver = solver
         me = solver.me
@@ -909,7 +914,7 @@ class DelayME(object):
         self.growth_key = growth_key
         self.growth_rxn = growth_rxn
 
-        mod_me = self.convert_model(dt, cplx_conc_dict)
+        mod_me = self.convert_model(dt, cplx_conc_dict, undiluted_cplxs=undiluted_cplxs)
         self.mod_me = mod_me
         self.solver = self.make_solver(mod_me, growth_key)
 
@@ -917,7 +922,8 @@ class DelayME(object):
         solver = ME_NLP1(mod_me, growth_key=growth_key)
         return solver
 
-    def convert_model(self, dt, cplx_conc_dict=None, csense='L'):
+    def convert_model(self, dt, cplx_conc_dict=None, csense='L',
+            undiluted_cplxs=None):
         """
         Make DelayME
 
@@ -938,7 +944,8 @@ class DelayME(object):
                 basis = me_solver.feas_basis
                 me_solver.bisectmu(basis=basis)
 
-            cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn)
+            cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn,
+                    undiluted_cplxs=undiluted_cplxs)
 
         # Start with MMmodel
         mam = MMmodel(me_solver, cplx_conc_dict, self.growth_key, self.growth_rxn)
@@ -987,7 +994,8 @@ class DelayME(object):
         return dme
 
 
-    def convert_model_scratch(self, dt, cplx_conc_dict=None, csense='L'):
+    def convert_model_scratch(self, dt, cplx_conc_dict=None, csense='L',
+            undiluted_cplxs=None):
         """
         Make DelayME
         Add new slack to complex to allow accum and depletion.
@@ -1012,7 +1020,8 @@ class DelayME(object):
                 basis = me_solver.feas_basis
                 me_solver.bisectmu(basis=basis)
 
-            cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn)
+            cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn,
+                    undiluted_cplxs=undiluted_cplxs)
 
         #for data in dme.complex_data:
         for dataid in cplx_conc_dict.keys():
@@ -1181,7 +1190,7 @@ class MMmodel(object):
             rxn.lower_bound = conc
             rxn.upper_bound = conc
 
-    def convert_model(self, cplx_conc_dict=None, csense='L'):
+    def convert_model(self, cplx_conc_dict=None, csense='L', undiluted_cplxs=None):
         """
         Make M&M from ME
         - replace complexes with complex-constrained flux constraints:
@@ -1201,7 +1210,8 @@ class MMmodel(object):
                 basis = me_solver.feas_basis
                 me_solver.bisectmu(basis=basis)
 
-            cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn)
+            cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn,
+                    undiluted_cplxs=undiluted_cplxs)
 
         #----------------------------------------------------
         """
@@ -1727,7 +1737,9 @@ class DelayedDynamicME(object):
                        LB_DEFAULT=-1000.,
                        UB_DEFAULT=1000.,
                        MU_MIN=0.,
-                       MU_MAX=2):
+                       MU_MAX=2,
+                       handle_negative_conc='timestep',
+                       ZERO_FLUX=1e-15):
         """
         result = simulate_batch()
 
@@ -1751,6 +1763,12 @@ class DelayedDynamicME(object):
                         the rest of the simulation.
         mm_model : the metabolism and macromolecule model used to implement
                    proteome inertia constraints
+        handle_negative_conc : 'throttle' or 'timestep'
+                How to handle concentrations about to become negative in next timestep.
+                'throttle': update lower_bound of the exchange rxn to estimated value
+                    that would prevent negative concentration (not always reliable
+                    since it can change the optimal solution)
+                'timestep': estimate the largest timestep where concentration is not negative.
 
         [Output]
         result
@@ -1942,6 +1960,7 @@ class DelayedDynamicME(object):
             # Update metabolite concentrations for next time step
             #------------------------------------------------
             reset_run = False
+            dt_new = dt     # If need to change timestep
 
             for metid, conc in conc_dict.iteritems():
                 v = 0.
@@ -1970,24 +1989,37 @@ class DelayedDynamicME(object):
                     v = v_out - v_in
 
                 if metid is not o2_e_id:
-                    conc_dict_prime[metid] = conc + v*X_biomass_prime*dt    # mmol/L = mmol/gDW/h * gDW/L * h
+                    # Update concentration for next timestep
+                    conc_dict_prime[metid] = conc + v*X_biomass_prime*dt_new
+                    # mmol/L = mmol/gDW/h * gDW/L * h
                     if conc_dict_prime[metid] < (ZERO_CONC - prec_bs):
-                        # Set flag to negate this run and recompute fluxes again with a new lower bound if any of the
-                        # metabolites end up with a negative concentration
-                        if verbosity >= 1:
-                            print metid, "below threshold, reset run flag triggered"
-                        reset_run = True
-                        lb_dict[rxn.id] = min(-conc_dict[metid] / (X_biomass_prime * dt), 0.)
-                        if verbosity >= 1:
-                            print 'Changing lower bounds %s to %.3f' % (metid, lb_dict[rxn.id])
-                    elif -v*X_biomass_prime*dt > conc_dict_prime[metid]/2:
-                        ### Update lower bounds as concentration is nearing 0
-                        lb_dict[rxn.id] = min(-conc_dict_prime[metid]/(X_biomass*dt), 0.)
-                        if verbosity >= 1:
-                            print 'Changing lower bounds %s to %.3f' %(metid, lb_dict[rxn.id])
+                        if handle_negative_conc == 'throttle':
+                            # if 'throttle'
+                            # Set flag to negate this run and recompute fluxes 
+                            # again with a new lower bound if any of the
+                            # metabolites end up with a negative concentration
+                            if verbosity >= 1:
+                                print metid, "below threshold, reset run flag triggered"
+                            reset_run = True
+                            lb_dict[rxn.id] = min(-conc_dict[metid]/(X_biomass_prime * dt_new),0.)
+                            if verbosity >= 1:
+                                print 'Changing lower bounds %s to %.3f' % (metid, lb_dict[rxn.id])
+                        elif handle_negative_conc == 'timestep':
+                            if v < -ZERO_FLUX:
+                                dt_new = -conc / (v*X_biomass_prime)
+                                if verbosity >= 1:
+                                    print 'Changed timestep to %g' % (dt_new)
+                                #--------------------------------
+                                # Update all variables with the new timestep 
+                                conc_dict_prime[metid] = conc + v*X_biomass_prime*dt_new
+                                X_biomass_prime = X_biomass + mu_opt*X_biomass*dt_new
+                                cplx_conc_dict_prime[cplx_id] = conc + v_dedt*dt_new
+                                #--------------------------------
+                        else:
+                            conc_dict_prime[metid] = 0.
                 else:
                     # Account for oxygen diffusion from headspace into medium
-                    conc_dict_prime[metid] = conc + (v*X_biomass_prime + kLa*(o2_head - conc))*dt
+                    conc_dict_prime[metid] = conc+(v*X_biomass_prime + kLa*(o2_head - conc))*dt_new
 
 
             # Reset the run if the reset_run flag is triggered, if not update the new biomass and conc_dict
@@ -2010,7 +2042,7 @@ class DelayedDynamicME(object):
 
             # ------------------------------------------------
             # Move to next time step
-            t_sim = t_sim + dt
+            t_sim = t_sim + dt_new
             iter_sim = iter_sim + 1
             times.append(t_sim)
             conc_profile.append(conc_dict.copy())
@@ -2115,6 +2147,32 @@ def get_exchange_rxn(me, metid, direction='both', exchange_one_rxn=None):
     return ex_rxn
 
 
+def get_undiluted_cplxs(solver, exclude_types=[
+    ComplexFormation, GenericFormationReaction, ComplexDegradation, PeptideDegradation]):
+    """
+    Find cplxs that are not diluted
+
+    Inputs
+    exclude_types : Reaction types that are allowed to not have complex dilution coupling
+    """
+    me = solver.me
+    undiluted_cplxs = []
+    for data in me.complex_data:
+        met = data.complex
+        for rxn in met.reactions:
+            if not any([isinstance(rxn,t) for t in exclude_types]):
+                try:
+                    if rxn.metabolites[met]<0:
+                        if not hasattr(rxn.metabolites[met],'subs'):
+                            undiluted_cplxs.append(data)
+                except TypeError:
+                    continue
+
+    undiluted_cplxs = list(set(undiluted_cplxs))
+
+    return undiluted_cplxs
+
+
 def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', undiluted_cplxs=None,
         ZERO=1e-20):
     """
@@ -2130,20 +2188,7 @@ def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', undiluted_
         muopt = x_dict[growth_rxn]
 
     if undiluted_cplxs is None:
-        undiluted_cplxs = []
-        for data in me.complex_data:
-            met = data.complex
-            for rxn in met.reactions:
-                if not isinstance(rxn,ComplexFormation) and \
-                    not isinstance(rxn,GenericFormationReaction):
-                    try:
-                        if rxn.metabolites[met]<0:
-                            if not hasattr(rxn.metabolites[met],'subs'):
-                                undiluted_cplxs.append(data)
-                    except TypeError:
-                        continue
-
-        undiluted_cplxs = list(set(undiluted_cplxs))
+        undiluted_cplxs = get_undiluted_cplxs(solver)
 
     solver.substitution_dict['mu'] = muopt
     sub_vals = [solver.substitution_dict[k] for k in solver.subs_keys_ordered]
