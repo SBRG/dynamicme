@@ -1190,7 +1190,8 @@ class MMmodel(object):
             rxn.lower_bound = conc
             rxn.upper_bound = conc
 
-    def convert_model(self, cplx_conc_dict=None, csense='L', undiluted_cplxs=None):
+    def convert_model(self, cplx_conc_dict=None, csense='L', undiluted_cplxs=None,
+            convert_mRNA=True):
         """
         Make M&M from ME
         - replace complexes with complex-constrained flux constraints:
@@ -1257,28 +1258,11 @@ class MMmodel(object):
             # All rxns catalyzed by this complex
             for rxn in cplx.reactions:
                 stoich = rxn.metabolites[cplx]
-                #if hasattr(stoich, 'subs'):
-                #if isinstance(stoich,Basic):
-                #if hasattr(stoich,'free_symbols') and mu in stoich.free_symbols:
-                #    keff_inv = -stoich/mu
-                #    rxn.add_metabolites({cons:keff_inv}, combine=False)
                 if stoich<0 and hasattr(stoich,'free_symbols') and mu in stoich.free_symbols:
                     ci = stoich.coeff(mu)
                     if not ci.free_symbols:
                         keff_inv = -float(ci)
                         rxn.add_metabolites({cons:keff_inv}, combine=False)
-
-            #rxn_dil_id = 'dilution_%s' % cplx.id
-            #try:
-            #    rxn_dil = DilutionReaction(rxn_dil_id)
-            #    mm.add_reaction(rxn_dil)
-            #except Exception:
-            #    rxn_dil = mm.reactions.get_by_id(rxn_dil_id)
-
-            #rxn_dil.lower_bound = 0.
-            #rxn_dil.add_metabolites({cplx: -1})
-            #rxn_dil.add_metabolites({cplx: 1.})
-
 
             # Remove complex from reaction usage so we don't double count
             # its dilution
@@ -1296,24 +1280,28 @@ class MMmodel(object):
             #------------------------------------------------
             rxn_conc.add_metabolites({cplx: -mu})
 
-        # Remove complex from reaction usage so we don't double count
-        # its dilution
-        # We already replaced with complex concentration rxns
-#        for data in mm.complex_data:
-#            try:
-#                cplx = data.complex
-#                for rxn in cplx.reactions:
-#                    stoich = rxn.metabolites[cplx]
-#                    if stoich<0 and
-#                        hasattr(rxn.metabolites[cplx],'free_symbols') and
-#                        mu in stoich.free_symbols:
-#                    rxn.subtract_metabolites({cplx:rxn.metabolites[cplx]})
-#                #mm.metabolites.remove(cplx)
-#            except KeyError:
-#                pass
-#            # Do update?
+            #================================================
+            # Also convert mRNA?
+            if convert_mRNA:
+                mm = make_mRNA_dynamic(mm)
 
         return mm
+
+    def make_mRNA_dynamic(self, mm):
+        """
+        Convert model to track dynamic RNA concentrations over time.
+        Inputs:
+            mm : MMmodel
+        """
+        #----------------------------------------------------
+        """
+        1. Add explicit dilution and degradation (coupled to degradosome) rxns:
+        d[mRNA]/dt = s1*vtrsc - mu*[mRNA] - vdeg
+        vdeg >= kdeg*[mRNA]  (an empirical fit--might be able to drop and recapitulate)
+        vdeg <= keff*[Degradosome]
+        2. Remove mRNA degradation and dilution stoichs from translation rxns
+        """
+
 
 
 #============================================================
