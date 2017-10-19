@@ -32,6 +32,7 @@ from dynamicme.model import ComplexDegradation, PeptideDegradation
 from cobrawe.me1tools import ME1tools
 from sympy import Basic
 
+import sympy
 import numpy as np
 import copy as cp
 import pandas as pd
@@ -905,14 +906,15 @@ class DelayME(object):
     decrease (dilution, degradation) of complexes.
     """
     def __init__(self, solver, dt, cplx_conc_dict=None,
-            growth_key='mu', growth_rxn='biomass_dilution',
-            undiluted_cplxs=[]):
+            growth_key='mu', growth_rxn='biomass_dilution', undiluted_cplxs=None):
         #super(DelayME, self).__init__(*args, **kwargs)
         self.me_solver = solver
         me = solver.me
         self.me = me
         self.growth_key = growth_key
         self.growth_rxn = growth_rxn
+        self.cplx_conc_dict = cplx_conc_dict
+        self.dt = dt
 
         mod_me = self.convert_model(dt, cplx_conc_dict, undiluted_cplxs=undiluted_cplxs)
         self.mod_me = mod_me
@@ -932,7 +934,9 @@ class DelayME(object):
         s.t. Sv = 0
              vform - mu*Ei - vdedt = 0  forall Complexes    [Complex]
              sum_j vij / keffj - Ei <= 0    [enzyme_capacity Constraint]
-             Ei - E0i - vdEdt*dt = 0        [delayed_abundance Constraint]
+             WRONG Ei - E0i - vdEdt*dt = 0        [delayed_abundance Constraint]
+              -> E - vform*dt + vdegr*dt = E0*exp(-mu*dt)
+
         """
         me_solver = self.me_solver
         me = self.me
@@ -946,6 +950,7 @@ class DelayME(object):
 
             cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn,
                     undiluted_cplxs=undiluted_cplxs)
+            self.cplx_conc_dict = cplx_conc_dict
 
         # Start with MMmodel
         mam = MMmodel(me_solver, cplx_conc_dict, self.growth_key, self.growth_rxn)
@@ -971,7 +976,9 @@ class DelayME(object):
             rxn_dedt.add_metabolites({cplx:-1})
             #------------------------------------------------
             # Add the delayed enzyme abundance constraint:
-            #   Ei - vdEdt*dt = E0i
+            #   WRONG Ei - vdEdt*dt = E0i
+            #   E = E0*exp(-mu*dt) + (vform-vdegr)*dt
+            #   E - vform*dt + vdegr*dt = E0*exp(-mu*dt)
             #------------------------------------------------
             cons_id = 'delayed_abundance_%s' % cplx.id
             try:
@@ -980,12 +987,20 @@ class DelayME(object):
             except Exception:
                 cons_delay = dme.metabolites.get_by_id(cons_id)
 
-            cons_delay._bound = cplx_conc_dict[cplx.id]
+            #cons_delay._bound = cplx_conc_dict[cplx.id]
+            cons_delay._bound = cplx_conc_dict[cplx.id]*sympy.exp(-mu*dt)
             cons_delay._constraint_sense = 'E'
-            rxn_dedt.add_metabolites({cons_delay:-dt}, combine=False)
 
             rxn_conc = dme.reactions.get_by_id('abundance_%s' % cplx.id)
             rxn_conc.add_metabolites({cons_delay:1}, combine=False)
+            #rxn_dedt.add_metabolites({cons_delay:-dt}, combine=False)
+            rxn_form = data.formation
+            rxn_form.add_metabolites({cons_delay:-dt}, combine=False)
+            for rxn in cplx.reactions:
+                if isinstance(rxn,ComplexDegradation):
+                    rxn.add_metabolites({cons_delay:dt}, combine=False)
+
+            #rxn_conc.add_metabolites({cons_delay:1}, combine=False)
             # need to relax the bounds on abundance_cplx variables
             # since we move the prior abundance into the constraint rhs now. 
             rxn_conc.lower_bound = 0.
@@ -994,155 +1009,51 @@ class DelayME(object):
         return dme
 
 
-    def convert_model_scratch(self, dt, cplx_conc_dict=None, csense='L',
-            undiluted_cplxs=None):
-        """
-        Make DelayME
-        Add new slack to complex to allow accum and depletion.
-        Then, motivate such accum & depletion by constraining
-        fluxes with protein amount at next time step.
-
-        max  mu
-        mu,v
-        s.t. Sv = 0
-             vform - mu*Ei - vdedt = 0  forall Complexes
-             sum_j vij / keffj - Ei <= 0
-             Ei - E0i - vdEdt*dt = 0
-        """
-        me = self.me
-        me_solver = self.me_solver
-        dme = cp.deepcopy(me)
-
-        if cplx_conc_dict is None:
-            # Initialize complex concentrations via ME sim
-            if me.solution is None:
-                warnings.warn('No initial solution! Solving now.')
-                basis = me_solver.feas_basis
-                me_solver.bisectmu(basis=basis)
-
-            cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn,
-                    undiluted_cplxs=undiluted_cplxs)
-
-        #for data in dme.complex_data:
-        for dataid in cplx_conc_dict.keys():
-            data = dme.complex_data.get_by_id(dataid)
-            cplx = data.complex
-            #------------------------------------------------
-            # Create reaction to track accum/depletion of enzyme E
-            #
-            # Can make more or less complex for next timestep
-            #   vform - mu*Ei - vdedt = 0  forall Complexes
-            #
-            #------------------------------------------------
-            # Create new rxn representing this complex's concentration
-            rxn_conc_id = 'abundance_%s' % cplx.id
-            try:
-                rxn_conc = ProteinAbundance(rxn_conc_id)
-                dme.add_reaction(rxn_conc)
-            except Exception:
-                rxn_conc = dme.reactions.get_by_id(rxn_conc_id)
-
-            rxn_conc.lower_bound = 0
-            rxn_conc.add_metabolites({cplx: -mu})
-
-            rxn_dedt_id = 'dedt_'+cplx.id
-            try:
-                rxn_dedt = ProteinDifferential(rxn_dedt_id)
-                dme.add_reaction(rxn_dedt)
-            except Exception:
-                rxn_dedt = dme.reactions.get_by_id(rxn_dedt_id)
-
-            rxn_dedt.lower_bound = -1000
-            rxn_dedt.upper_bound = 1000
-            # Add to complex's mass balance constraint
-            rxn_dedt.add_metabolites({cplx:-1})
-
-            #------------------------------------------------
-            # Remove complex from reaction usage so we don't double count
-            # its dilution
-            #------------------------------------------------
-            for rxn in cplx.reactions:
-                stoich = rxn.metabolites[cplx]
-                if stoich<0 and \
-                        hasattr(rxn.metabolites[cplx],'free_symbols') and \
-                        mu in stoich.free_symbols and \
-                        not isinstance(rxn, ProteinAbundance):
-                    rxn.subtract_metabolites({cplx:rxn.metabolites[cplx]})
-
-            #------------------------------------------------
-            # This enzyme slack on its own would allow no enz production
-            # Therefore, we add the next constraint (and rxn)
-            #
-            #   sum_j vij / keffj - Ei <= 0
-            #
-            #------------------------------------------------
-            cons_id = 'enzyme_capacity_%s' % (cplx.id)
-            try:
-                cons_cap = Constraint(cons_id)
-                dme.add_metabolites(cons_cap)
-            except Exception:
-                cons_cap = dme.metabolites.get_by_id(cons_id)
-
-            cons_cap._bound = 0
-            cons_cap._constraint_sense = csense
-
-            rxn_conc.add_metabolites({cons_cap:-1})
-
-            # More specific and more correct
-            for rxn in cplx.reactions:
-                stoich = rxn.metabolites[cplx]
-                #if hasattr(stoich,'free_symbols') and mu in stoich.free_symbols:
-                #    keff_inv = -stoich/mu
-                #    rxn.add_metabolites({cons_cap:keff_inv}, combine=False)
-                if stoich<0 and hasattr(stoich,'free_symbols') and mu in stoich.free_symbols:
-                    ci = stoich.coeff(mu)
-                    if not ci.free_symbols:
-                        keff_inv = -float(ci)
-                        rxn.add_metabolites({cons_cap:keff_inv}, combine=False)
-
-            #------------------------------------------------
-            # Add the delayed enzyme abundance constraint:
-            #
-            #   Ei - vdEdt*dt = E0i
-            #   
-            #------------------------------------------------
-            cons_id = 'delayed_abundance_%s' % cplx.id
-            try:
-                cons_delay = AbundanceConstraint(cons_id)
-                dme.add_metabolites(cons_delay)
-            except Exception:
-                cons_delay = dme.metabolites.get_by_id(cons_id)
-
-            cons_delay._bound = cplx_conc_dict[cplx.id]
-            cons_delay._constraint_sense = 'E'
-            rxn_conc.add_metabolites({cons_delay:1}, combine=False)
-            rxn_dedt.add_metabolites({cons_delay:-dt}, combine=False)
-
-        return dme
-
-
-    def update_horizon(self, dt):
+    def update_horizon(self, dt, cplx_conc_dict=None):
         """
         Update timestep used in simulation & constraints
         """
         mm = self.mod_me
-        rxns_dedt = [r for r in mm.reactions if isinstance(r,ProteinDifferential)]
-        for rxn in rxns_dedt:
-            for met in rxn.metabolites.keys():
-                if isinstance(met, AbundanceConstraint):
-                    rxn._metabolites[met] = -dt
+        self.dt = dt
+        if cplx_conc_dict is None:
+            cplx_conc_dict = self.cplx_conc_dict
+        ### Update:
+        # cons_delay:
+        #   1) ._bound
+        #   2) rxn_form
+        #   3) ComplexDegradation rxns
+        for dataid,conc in iteritems(cplx_conc_dict):
+            data = mm.complex_data.get_by_id(dataid)
+            cplx = data.complex
+            cons_id = 'delayed_abundance_%s' % cplx.id
+            cons = mm.metabolites.get_by_id(cons_id)
+            cons._bound = conc*sympy.exp(-mu*dt)
+
+        #rxns_dedt = [r for r in mm.reactions if isinstance(r,ProteinDifferential)]
+        #for rxn in rxns_dedt:
+        #    for met in rxn.metabolites.keys():
+        #        if isinstance(met, AbundanceConstraint):
+        #            rxn._metabolites[met] = -dt
 
 
-    def update_cplx_concs(self, cplx_conc_dict):
+    def update_cplx_concs(self, cplx_conc_dict, dt=None):
         """
         Update complex concentrations in the constraints.
         (Different from MMmodel, which changes variable bounds.)
         """
         mm = self.mod_me
-        for cplx_id,conc in iteritems(cplx_conc_dict):
-            cons_id = 'delayed_abundance_%s' % cplx_id
+        if dt is None:
+            dt = self.dt
+        for dataid,conc in iteritems(cplx_conc_dict):
+            data = mm.complex_data.get_by_id(dataid)
+            cplx = data.complex
+            cons_id = 'delayed_abundance_%s' % cplx.id
             cons = mm.metabolites.get_by_id(cons_id)
-            cons._bound = conc
+            cons._bound = conc*sympy.exp(-mu*dt)
+            # OLD:
+            # cons_id = 'delayed_abundance_%s' % cplx_id
+            # cons = mm.metabolites.get_by_id(cons_id)
+            # cons._bound = conc
 
 
 #============================================================
@@ -1168,6 +1079,7 @@ class MMmodel(object):
         self.growth_key = growth_key
         self.growth_rxn = growth_rxn
         self.cplx_rxn_keff = {}
+        self.cplx_conc_dict = cplx_conc_dict
 
         mm = self.convert_model(cplx_conc_dict)
         self.mm = mm
@@ -1213,6 +1125,8 @@ class MMmodel(object):
 
             cplx_conc_dict = get_cplx_concs(me_solver, growth_rxn=self.growth_rxn,
                     undiluted_cplxs=undiluted_cplxs)
+
+            self.cplx_conc_dict = cplx_conc_dict
 
         #----------------------------------------------------
         """
@@ -1283,7 +1197,7 @@ class MMmodel(object):
             #================================================
             # Also convert mRNA?
             if convert_mRNA:
-                mm = make_mRNA_dynamic(mm)
+                mm = self.make_mRNA_dynamic(mm)
 
         return mm
 
@@ -1301,6 +1215,8 @@ class MMmodel(object):
         vdeg <= keff*[Degradosome]
         2. Remove mRNA degradation and dilution stoichs from translation rxns
         """
+        warnings.warn('Dynamic mRNA not yet implemented!')
+        return mm
 
 
 
@@ -1825,7 +1741,7 @@ class DelayedDynamicME(object):
         biomass_profile = [X_biomass]
         ex_flux_profile = [ex_flux_dict.copy()]
         rxn_flux_profile= [rxn_flux_dict.copy()]
-        mu_profile = [np.nan]
+        mu_profile = []
 
         iter_sim = 0
         recompute_fluxes = True     # In first iteration always compute
@@ -1931,7 +1847,8 @@ class DelayedDynamicME(object):
             #================================================
             dt_new = dt     # If need to change timestep
             # Get biomass at next timestep assuming default timestep used
-            X_biomass_prime = X_biomass + mu_opt*X_biomass*dt_new
+            #X_biomass_prime = X_biomass + mu_opt*X_biomass*dt_new
+            X_biomass_prime = X_biomass*np.exp(mu_opt*dt_new)
             X_biomass_trpzd = (X_biomass + X_biomass_prime)/2
             """
             for a cell:
@@ -1991,19 +1908,40 @@ class DelayedDynamicME(object):
             # Actually update complex concentrations for next time step
             # using smallest required timestep.
             #------------------------------------------------
+            dme.dt = dt_new
             if verbosity >= 1:
                 if dt_new != dt:
                     print 'Changed timestep to %g' % (dt_new)
 
             for cplx_id, conc in iteritems(cplx_conc_dict):
                 cplx = dme.metabolites.get_by_id(cplx_id)
-                dedt = dme.reactions.get_by_id('dedt_'+cplx_id)
-                v_dedt = 0.
+                # E - vform*dt + vdegr*dt = E0*exp(-mu*dt)
+                rxn_conc = dme.reactions.get_by_id('abundance_%s'%cplx.id)
+                conc_new = conc
                 try:
-                    v_dedt = dme.solution.x_dict[dedt.id]
+                    conc_new = dme.solution.x_dict[rxn_conc.id]
                 except:
                     continue
-                conc_new = conc + v_dedt*dt_new
+                #dedt = dme.reactions.get_by_id('dedt_'+cplx_id)
+                #v_dedt = 0.
+                #try:
+                #    v_dedt = dme.solution.x_dict[dedt.id]
+                #except:
+                #    continue
+                ##conc_new = conc + v_dedt*dt_new
+                #formation = dme.reactions.get_by_id('formation_'+cplx_id)
+                #v_form = 0.
+                #try:
+                #    v_form = dme.solution.x_dict[formation.id]
+                #except:
+                #    continue
+                #degr_id = 'degradation_'+cplx_id
+                #v_degr = 0.
+                #try:
+                #    v_degr = dme.solution.x_dict[degr_id]
+                #except:
+                #    continue
+                #conc_new = conc*np.exp(-mu_opt*dt_new) + (v_form-v_degr)*dt_new
                 cplx_conc_dict_prime[cplx_id] = conc_new
 
             delay_model.update_cplx_concs(cplx_conc_dict_prime)
@@ -2082,6 +2020,9 @@ class DelayedDynamicME(object):
                 print 'Concentrations:', conc_dict
                 print 'Growth rate:', mu_opt
 
+
+        # Append last growth rate once more
+        mu_profile.append(mu_opt)
 
         result = {'biomass':biomass_profile,
                   'concentration':conc_profile,
