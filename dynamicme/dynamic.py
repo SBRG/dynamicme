@@ -913,12 +913,20 @@ class DelayME(object):
         self.me = me
         self.growth_key = growth_key
         self.growth_rxn = growth_rxn
-        self.cplx_conc_dict = cplx_conc_dict
         self.dt = dt
 
         mod_me = self.convert_model(dt, cplx_conc_dict, undiluted_cplxs=undiluted_cplxs)
         self.mod_me = mod_me
         self.solver = self.make_solver(mod_me, growth_key)
+        self.cplx_conc_dict = cplx_conc_dict
+
+    @property
+    def cplx_conc_dict(self):
+        return self._cplx_conc_dict
+
+    @cplx_conc_dict.setter
+    def cplx_conc_dict(self, value):
+        self._cplx_conc_dict = value
 
     def make_solver(self, mod_me, growth_key='mu'):
         solver = ME_NLP1(mod_me, growth_key=growth_key)
@@ -934,8 +942,7 @@ class DelayME(object):
         s.t. Sv = 0
              vform - mu*Ei - vdedt = 0  forall Complexes    [Complex]
              sum_j vij / keffj - Ei <= 0    [enzyme_capacity Constraint]
-             WRONG Ei - E0i - vdEdt*dt = 0        [delayed_abundance Constraint]
-              -> E - vform*dt + vdegr*dt = E0*exp(-mu*dt)
+             Ei - E0i - vdEdt*dt = 0        [delayed_abundance Constraint]
 
         """
         me_solver = self.me_solver
@@ -976,9 +983,7 @@ class DelayME(object):
             rxn_dedt.add_metabolites({cplx:-1})
             #------------------------------------------------
             # Add the delayed enzyme abundance constraint:
-            #   WRONG Ei - vdEdt*dt = E0i
-            #   E = E0*exp(-mu*dt) + (vform-vdegr)*dt
-            #   E - vform*dt + vdegr*dt = E0*exp(-mu*dt)
+            #   Ei - vdEdt*dt = E0i
             #------------------------------------------------
             cons_id = 'delayed_abundance_%s' % cplx.id
             try:
@@ -987,18 +992,18 @@ class DelayME(object):
             except Exception:
                 cons_delay = dme.metabolites.get_by_id(cons_id)
 
-            #cons_delay._bound = cplx_conc_dict[cplx.id]
-            cons_delay._bound = cplx_conc_dict[cplx.id]*sympy.exp(-mu*dt)
+            cons_delay._bound = cplx_conc_dict[cplx.id]
+            #cons_delay._bound = cplx_conc_dict[cplx.id]*sympy.exp(-mu*dt)
             cons_delay._constraint_sense = 'E'
 
             rxn_conc = dme.reactions.get_by_id('abundance_%s' % cplx.id)
             rxn_conc.add_metabolites({cons_delay:1}, combine=False)
-            #rxn_dedt.add_metabolites({cons_delay:-dt}, combine=False)
-            rxn_form = data.formation
-            rxn_form.add_metabolites({cons_delay:-dt}, combine=False)
-            for rxn in cplx.reactions:
-                if isinstance(rxn,ComplexDegradation):
-                    rxn.add_metabolites({cons_delay:dt}, combine=False)
+            rxn_dedt.add_metabolites({cons_delay:-dt}, combine=False)
+            # rxn_form = data.formation
+            # rxn_form.add_metabolites({cons_delay:-dt}, combine=False)
+            # for rxn in cplx.reactions:
+            #     if isinstance(rxn,ComplexDegradation):
+            #         rxn.add_metabolites({cons_delay:dt}, combine=False)
 
             #rxn_conc.add_metabolites({cons_delay:1}, combine=False)
             # need to relax the bounds on abundance_cplx variables
@@ -1022,18 +1027,18 @@ class DelayME(object):
         #   1) ._bound
         #   2) rxn_form
         #   3) ComplexDegradation rxns
-        for dataid,conc in iteritems(cplx_conc_dict):
-            data = mm.complex_data.get_by_id(dataid)
-            cplx = data.complex
-            cons_id = 'delayed_abundance_%s' % cplx.id
-            cons = mm.metabolites.get_by_id(cons_id)
-            cons._bound = conc*sympy.exp(-mu*dt)
+        #for dataid,conc in iteritems(cplx_conc_dict):
+        #    data = mm.complex_data.get_by_id(dataid)
+        #    cplx = data.complex
+        #    cons_id = 'delayed_abundance_%s' % cplx.id
+        #    cons = mm.metabolites.get_by_id(cons_id)
+        #    cons._bound = conc*sympy.exp(-mu*dt)
 
-        #rxns_dedt = [r for r in mm.reactions if isinstance(r,ProteinDifferential)]
-        #for rxn in rxns_dedt:
-        #    for met in rxn.metabolites.keys():
-        #        if isinstance(met, AbundanceConstraint):
-        #            rxn._metabolites[met] = -dt
+        rxns_dedt = [r for r in mm.reactions if isinstance(r,ProteinDifferential)]
+        for rxn in rxns_dedt:
+            for met in rxn.metabolites.keys():
+                if isinstance(met, AbundanceConstraint):
+                    rxn._metabolites[met] = -dt
 
 
     def update_cplx_concs(self, cplx_conc_dict, dt=None):
@@ -1041,6 +1046,7 @@ class DelayME(object):
         Update complex concentrations in the constraints.
         (Different from MMmodel, which changes variable bounds.)
         """
+        self.cplx_conc_dict = cplx_conc_dict
         mm = self.mod_me
         if dt is None:
             dt = self.dt
@@ -1049,11 +1055,8 @@ class DelayME(object):
             cplx = data.complex
             cons_id = 'delayed_abundance_%s' % cplx.id
             cons = mm.metabolites.get_by_id(cons_id)
-            cons._bound = conc*sympy.exp(-mu*dt)
-            # OLD:
-            # cons_id = 'delayed_abundance_%s' % cplx_id
-            # cons = mm.metabolites.get_by_id(cons_id)
-            # cons._bound = conc
+            # cons._bound = conc*sympy.exp(-mu*dt)
+            cons._bound = conc
 
 
 #============================================================
@@ -1079,12 +1082,20 @@ class MMmodel(object):
         self.growth_key = growth_key
         self.growth_rxn = growth_rxn
         self.cplx_rxn_keff = {}
-        self.cplx_conc_dict = cplx_conc_dict
 
         mm = self.convert_model(cplx_conc_dict)
         self.mm = mm
         self.mod_me = mm
         self.solver = self.make_mm_solver(mm, growth_key)
+        self.cplx_conc_dict = cplx_conc_dict
+
+    @property
+    def cplx_conc_dict(self):
+        return self._cplx_conc_dict
+
+    @cplx_conc_dict.setter
+    def cplx_conc_dict(self, value):
+        self._cplx_conc_dict = value
 
     def make_mm_solver(self, mm, growth_key='mu'):
         solver = ME_NLP1(mm, growth_key=growth_key)
