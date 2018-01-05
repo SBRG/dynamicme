@@ -28,9 +28,9 @@ class HelpME(object):
         if model_path is None:
             home = os.path.expanduser('~')
             if prototyping:
-                filename = os.path.join(home,'ME','models','tinyME_nostress_v1.pickle')
+                filename = os.path.join(home,'ME','models','tinyME_nostress_v2.pickle')
                 basisfile = None
-                solverfile  = os.path.join(home,'ME','models','solver_tinyME_nostress_v1.pickle')
+                solverfile  = os.path.join(home,'ME','models','solver_tinyME_nostress_v2.pickle')
             else:
                 if protease:
                     filename = os.path.join(home,'ME','models','iLE_protdegr.pickle')
