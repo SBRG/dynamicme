@@ -18,6 +18,7 @@ from cobra import Reaction, Metabolite
 import numpy as np
 import copy as cp
 import pandas as pd
+import scipy.stats as stats
 import time
 import warnings
 import cobra
@@ -46,6 +47,7 @@ class MetaOpt(object):
 
         random_move = LocalMove(get_param_fun, set_param_fun)
         self.move_objects = [random_move]
+        self.stats = {}
 
 
     def calc_threshold(self, objval0, objval):
@@ -55,7 +57,7 @@ class MetaOpt(object):
 
     def optimize(self, y_meas, Thresh0=1.0,
                 max_iter_phase1=10, max_iter_phase2=100, max_reject=10,
-                verbosity=2):
+                verbosity=2, param_confidence=0.95, use_gradient=True):
         """
         Tune parameters (e.g., keffs) to fit vector of measurements
         """
@@ -112,31 +114,48 @@ class MetaOpt(object):
         # Perform local moves
         move_objects = self.move_objects
         n_iter = 0
+        objval = objval0
         obj_best = objval0
         x0 = self.get_param_fun(mdl)
+        x_pert = x0
         x_best = cp.copy(x0)
         y_sim = y_sim0
         y_best = cp.copy(y_sim)
 
+        nx = len(x0)
+        dzdxs_list = [np.zeros((max_iter_phase1, nx)) for mover in move_objects]
+
         while n_iter < max_iter_phase1:
-            n_iter = n_iter + 1
-            for mover in move_objects:
+            for i_mover, mover in enumerate(move_objects):
                 #--------------------------------------------
                 tic = time.time()
                 #--------------------------------------------
+                dzdxs1 = dzdxs_list[i_mover]
                 # Local move
                 if verbosity >= 1:
                     print '[Phase I] Iter %d:\t Performing local move:'%n_iter, type(mover)
 
                 mover.move(mdl)
+                x_prev = x_pert
                 x_pert = self.get_param_fun(mdl)
                 # Simulate
                 y_sim = self.sim_fun(mdl)
                 # Compute objective value (error)
+                objval_prev = objval
                 objval = self.obj_fun(y_sim, y_meas)
-
                 # Unmove: generate samples surrounding initial point
                 mover.unmove(mdl)
+
+                # Keep track of dzdx
+                dz = objval - objval_prev
+                dx = np.array(x_pert) - np.array(x_prev)
+                dzdx = dz/dx
+                #try:
+                dzdxs1[n_iter,:] = dzdx
+                # except:
+                #     print dzdx.shape
+                #     print dzdxs1.shape
+                #     raise Exception
 
                 if objval < obj_best:
                     obj_best = objval
@@ -166,14 +185,17 @@ class MetaOpt(object):
                         print 'y=', y_sim
                     print '//============================================'
 
+            #------------------------------------------------
+            n_iter = n_iter + 1
+            #------------------------------------------------
+
         #----------------------------------------------------
         # Phase II: optimization
         #----------------------------------------------------
         n_reject = 0
         n_iter = 0
         while (n_iter < max_iter_phase2) and (n_reject < max_reject):
-            n_iter = n_iter + 1
-            for mover in move_objects:
+            for i_mover, mover in enumerate(move_objects):
                 #--------------------------------------------
                 tic = time.time()
                 #--------------------------------------------
@@ -182,7 +204,29 @@ class MetaOpt(object):
                 if verbosity >= 1:
                     print '[Phase II] Iter %d:\t Performing local move:'%n_iter, type(mover)
 
-                mover.move(mdl)
+                dzdxs = dzdxs_list[i_mover]
+                # Any dzdx consistently >0 or <0 ?
+                m_cis = [mean_ci( dzdxs[:,i], confidence=param_confidence) for i in range(nx)]
+                dzdx_m = np.array([m_ci[0] for m_ci in m_cis])
+                dzdx_l = [m_ci[1] for m_ci in m_cis]
+                dzdx_u = [m_ci[2] for m_ci in m_cis]
+
+                for i in range(nx):
+                    l = dzdx_l[i]
+                    u = dzdx_u[i]
+                    if np.sign(l) != np.sign(u):
+                        dzdx_m[i] = 0.
+
+                if not self.stats.has_key('gradient'):
+                    self.stats['gradient'] = [None for i in move_objects]
+
+                self.stats['gradient'][i_mover] = dzdx_m
+
+                if use_gradient:
+                    mover.move(mdl, dzdx=dzdx_m)
+                else:
+                    mover.move(mdl)
+
                 x_pert = self.get_param_fun(mdl)
                 # Simulate
                 y_sim = self.sim_fun(mdl)
@@ -223,6 +267,13 @@ class MetaOpt(object):
                         objval, obj_best, Tmax, T_new, move_str, n_reject, toc)
                     print '//============================================'
 
+            #------------------------------------------------
+            n_iter += 1
+            #------------------------------------------------
+
+        # Save stats
+        self.stats['gradients'] = dzdxs_list
+
         return y_best, opt_stats, x_best
 
 
@@ -254,6 +305,7 @@ class LocalMove(object):
         }
         # Memory to rollback to previous parameters
         self.x_rollback = None
+        self.dydx = None
 
     def unmove(self, mdl):
         """
@@ -263,9 +315,8 @@ class LocalMove(object):
             print 'No pre-move params stored. Not doing anything'
         else:
             x0 = self.x_rollback
-            self.set_param_fun(mdl, x0)
 
-    def move(self, mdl, method='uniform'):
+    def move(self, mdl, method='uniform', dzdx=None):
         """
         Randomly perturb me according to provided params
         """
@@ -283,6 +334,12 @@ class LocalMove(object):
                 rmin = params['min']
                 rmax = params['max']
                 rs = np.random.uniform(rmin, rmax, n_pert)
+                # Correct with gradient information if available
+                if dzdx is not None:
+                    # If obj increases with x, want to decrease x
+                    rs[dzdx>0] = 10**(-abs(np.log10(rs[dzdx>0])))
+                    rs[dzdx<0] = 10**(abs(np.log10(rs[dzdx<0])))
+
                 # Perturb individually or in groups (all up/down)?
                 self.set_param_fun(mdl, rs*x0)
 
@@ -291,7 +348,13 @@ class LocalMove(object):
                 norm_std  = params['std']
                 kmin  = params['min']
                 kmax  = params['max']
-                ks = 10**np.random.normal(norm_mean, norm_std, n_pert)
+                # Correct with gradient information if available
+                es = np.random.normal(norm_mean, norm_std, n_pert)
+                if dzdx is not None:
+                    es[dzdx>0] = -abs(es[dzdx>0])
+                    es[dzdx<0] = abs(es[dzdx<0])
+
+                ks = 10**es
                 ks[ks < kmin] = kmin
                 ks[ks > kmax] = kmax
                 self.set_param_fun(mdl, ks*x0)
@@ -301,3 +364,12 @@ class LocalMove(object):
 
         else:
             warnings.warn('No parameters found for move: random')
+
+
+def mean_ci(x, confidence=0.95):
+    # Return mean and confidence interval
+    n = len(x)
+    m,se = np.mean(x), stats.sem(x)
+    h = se*stats.t._ppf((1+confidence)/2., n-1)
+
+    return m, m-h, m+h
