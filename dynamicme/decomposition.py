@@ -12,11 +12,12 @@
 
 from six import iteritems
 from builtins import range
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix, csc_matrix
 from cobra.core.Solution import Solution
 from cobra import Reaction, Metabolite, Model
 from gurobipy import *
 
+import numpy as np
 import warnings
 
 class Decomposer(object):
@@ -26,7 +27,9 @@ class Decomposer(object):
         self._master = None
         self._sub = None
         self._A = None
+        self._Acsc = None
         self._B = None
+        self._Bcsc = None
         self._d = None
         self._csenses = None
         self._xs = None
@@ -61,7 +64,9 @@ class Decomposer(object):
     def _split_constraints(self):
         A,B,d,csenses,xs,ys = split_constraints(self.milp)
         self._A = A
+        self._Acsc = A.tocsc()
         self._B = B
+        self._Bcsc = B.tocsc()
         self._d = d
         self._csenses = csenses
         self._x0 = xs
@@ -82,11 +87,12 @@ class Decomposer(object):
         ys0 = self._y0
         ny = len(ys0)
         B = self._B
-        fy = [yj.Obj for yj in ys0]
+        fy = np.array([yj.Obj for yj in ys0])
         master = Model('master')
         z = master.addVar(LB, UB, 0., GRB.CONTINUOUS, 'z')
         ys = [master.addVar(y.LB, y.UB, y.Obj, y.VType, y.VarName) for y in ys0]
-        master.addConstr(z >= sum([fy[j]*ys[j] for j in range(ny)]))
+        rhs = LinExpr(fy, ys)
+        master.addConstr(z, GRB.GREATER_EQUAL, rhs)
         master.setObjective(z, GRB.MINIMIZE)
 
         self._z = z
@@ -94,13 +100,14 @@ class Decomposer(object):
         self._fy = fy
 
         master._decomposer = self   # Need this reference to access methods inside callback
+        master._verbosity = 0
 
         master.Params.Presolve = 0          # To be safe, turn off
         master.Params.LazyConstraints = 1   # Required to use cbLazy
 
         return master
 
-    def make_sub(self, yopt=None):
+    def make_sub(self):
         """
         Constraint doesn't change.
         Objective changes with RMP solution, so yopt is optional when initiating.
@@ -125,8 +132,8 @@ class Decomposer(object):
                 for i,sense in enumerate(csenses)]
         wl = [sub.addVar(0., UB, 0., GRB.CONTINUOUS, 'wl[%d]'%i) for i in range(n)]
         wu = [sub.addVar(0., UB, 0., GRB.CONTINUOUS, 'wu[%d]'%i) for i in range(n)]
-        xl = [x.LB for x in xs0]
-        xu = [x.UB for x in xs0]
+        xl = np.array([x.LB for x in xs0])
+        xu = np.array([x.UB for x in xs0])
         cx  = [x.Obj for x in xs0]
 
         self._xl = xl
@@ -137,16 +144,21 @@ class Decomposer(object):
         self._wu = wu
 
         # This dual constraint never changes
-        #dual_cons = [sub.addConstr(sum([A[i,j]*wa[i] for i in range(m)]) + \
-        #           wl[j] - wu[j] == cx[j], name=xs0[j].VarName) for j in range(nx)]
-        dual_cons = [sub.addConstr(
-            LinExpr(A[:,j].toarray().flat, wa) + wl[j] - wu[j] == cx[j]
-            ) for j in range(nx)]
-        if yopt is not None:
-            sub.setObjective(
-                sum([d[i]*wa[i]-sum([B[i,j]*yopt[j]*wa[i] for j in range(ny)]) for i in range(m)]) +
-                sum([xl[j]*wl[j] for j in range(n)]) -
-                sum([xu[j]*wu[j] for j in range(n)]), GRB.MAXIMIZE)
+        # dual_cons = [sub.addConstr(sum([A[i,j]*wa[i] for i in range(m)]) + \
+        #            wl[j] - wu[j] == cx[j], name=xs0[j].VarName) for j in range(nx)]
+        # dual_cons = [sub.addConstr(
+        #     LinExpr(A[:,j].toarray().flat, wa) + wl[j] - wu[j] == cx[j]
+        #     ) for j in range(nx)]
+
+        Acsc = self._Acsc
+        dual_cons = []
+        for j,x0 in enumerate(xs0):
+            rinds = Acsc.indices[Acsc.indptr[j]:Acsc.indptr[j+1]]
+            coefs = Acsc.data[Acsc.indptr[j]:Acsc.indptr[j+1]]
+            expr  = LinExpr(coefs, [wa[i] for i in rinds])
+            #expr.addTerms([1., -1.], [wl[j], wu[j]])
+            cons  = sub.addConstr(expr+wl[j]-wu[j], GRB.EQUAL, cx[j], name=x0.VarName)
+            dual_cons.append(cons)
 
         return sub
 
@@ -164,11 +176,18 @@ class Decomposer(object):
         xu = self._xu
         m,ny = B.shape
         n = len(xl)
-        sub.setObjective(
-            sum([d[i]*wa[i]-sum([B[i,j]*yopt[j]*wa[i] for j in range(ny)]) \
-                for i in range(m)]) + \
-                sum([xl[j]*wl[j] for j in range(n)]) - \
-                sum([xu[j]*wu[j] for j in range(n)]), GRB.MAXIMIZE)
+
+        #sub.setObjective(
+        #    sum([d[i]*wa[i]-sum([B[i,j]*yopt[j]*wa[i] for j in range(ny)]) \
+        #        for i in range(m)]) + \
+        #        sum([xl[j]*wl[j] for j in range(n)]) - \
+        #        sum([xu[j]*wu[j] for j in range(n)]), GRB.MAXIMIZE)
+
+        dBy = d - B*yopt
+        cinds = dBy.nonzero()[0]
+        dBywa = LinExpr([dBy[j] for j in cinds], [wa[j] for j in cinds])
+        obj = dBywa + LinExpr(xl,wl) - LinExpr(xu,wu)
+        sub.setObjective(obj, GRB.MAXIMIZE)
 
     def make_optcut(self):
         z = self._z
@@ -181,13 +200,21 @@ class Decomposer(object):
         m = len(d)
         n = len(xl)
         ny = len(ys)
-        wa = [w.X for w in self._wa]
-        wl = [w.X for w in self._wl]
-        wu = [w.X for w in self._wu]
-        cut = z >= sum([fy[j]*ys[j] for j in range(ny)]) + \
-            sum([d[i]*wa[i]-sum([B[i,j]*ys[j]*wa[i] for j in range(ny)]) for i in range(m)]) + \
-            sum([xl[j]*wl[j] for j in range(n)]) - \
-            sum([xu[j]*wu[j] for j in range(n)])
+        wa = np.array([w.X for w in self._wa])
+        wl = np.array([w.X for w in self._wl])
+        wu = np.array([w.X for w in self._wu])
+        Bcsc = self._Bcsc
+
+        # cut = z >= quicksum([fy[j]*ys[j] for j in range(ny)]) + \
+        #         quicksum([d[i]*wa[i]-quicksum([B[i,j]*ys[j]*wa[i] for j in range(ny)]) \
+        #         for i in range(m)]) + \
+        #         quicksum([xl[j]*wl[j] for j in range(n)]) -\
+        #         quicksum([xu[j]*wu[j] for j in range(n)])
+
+        waB  = wa*Bcsc
+        cinds = waB.nonzero()[0]
+        waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
+        cut = z >= LinExpr(fy,ys) + sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu)
 
         return cut
 
@@ -211,17 +238,19 @@ class Decomposer(object):
         m = len(d)
         n = len(xl)
 
-        cut = sum(
-            [d[i]*wa[i]-sum([B[i,j]*ys[j]*wa[i] for j in range(ny)]) for i in range(m)]) + \
-            sum([xl[j]*wl[j] for j in range(n)]) - \
-            sum([xu[j]*wu[j] for j in range(n)]) <= 0
+        Bcsc = self._Bcsc
+        waB  = wa*Bcsc
+        cinds = waB.nonzero()[0]
+        waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
+        cut = sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu) <= 0
 
         return cut
 
     def calc_sub_objval(self, yopt):
         sub = self._sub
         fy = self._fy
-        objval = sub.ObjVal + sum([fy[j]*yopt[j] for j in range(len(yopt))])
+        objval = sub.ObjVal + sum(fy*yopt)
+        #objval = sub.ObjVal + sum([fy[j]*yopt[j] for j in range(len(yopt))])
 
         return objval
 

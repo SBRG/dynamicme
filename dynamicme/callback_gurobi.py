@@ -45,6 +45,9 @@ def cb_benders(model, where):
             zsub = decomposer.calc_sub_objval(yopt)
             gap = zmaster - zsub
 
+            if model._verbosity > 0:
+                print('zmaster=%g. zsub=%g. gap=%g' % (zmaster, zsub, gap))
+
             if abs(gap) > GAPTOL:
                 optcut = decomposer.make_optcut()
                 model.cbLazy(optcut)
