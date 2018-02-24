@@ -137,8 +137,11 @@ class Decomposer(object):
         self._wu = wu
 
         # This dual constraint never changes
-        dual_cons = [sub.addConstr(sum([A[i,j]*wa[i] for i in range(m)]) + \
-                   wl[j] - wu[j] == cx[j], name=xs0[j].VarName) for j in range(nx)]
+        #dual_cons = [sub.addConstr(sum([A[i,j]*wa[i] for i in range(m)]) + \
+        #           wl[j] - wu[j] == cx[j], name=xs0[j].VarName) for j in range(nx)]
+        dual_cons = [sub.addConstr(
+            LinExpr(A[:,j].toarray().flat, wa) + wl[j] - wu[j] == cx[j]
+            ) for j in range(nx)]
         if yopt is not None:
             sub.setObjective(
                 sum([d[i]*wa[i]-sum([B[i,j]*yopt[j]*wa[i] for j in range(ny)]) for i in range(m)]) +
@@ -283,5 +286,7 @@ def split_constraints(model):
     ny = len(ys)
     A = coo_matrix((xdata, (xrow_inds, xcol_inds)), shape=(M,nx)).tocsr()
     B = coo_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny)).tocsr()
+    #A = csr_matrix((xdata, (xrow_inds, xcol_inds)), shape=(M,nx))
+    #B = csr_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny))
 
     return A, B, d, csenses, xs, ys
