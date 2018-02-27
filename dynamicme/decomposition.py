@@ -350,7 +350,11 @@ class DecompModel(object):
 
     def __init__(self, model):
         self.model = model
-        self.qsolver = None
+        qsolver = QMINOS()
+        qsolver.set_realopts('lp', {'Feasibility tol':1e-15, 'Optimality tol':1e-15})
+        qsolver.set_realopts('lp_q2', {'Feasibility tol':1e-15, 'Optimality tol':1e-15})
+        self.qsolver = qsolver
+
         self.lp_basis = None
         self.qp_basis = None
         self.A = None
@@ -373,9 +377,9 @@ class DecompModel(object):
     # def __setattr__(self, name, value):
     #     super(DecompModel, self).__setattr__(name, value)
 
-    def optimize(self, precision='double'):
+    def optimize(self, precision='gurobi'):
         model = self.model
-        if precision=='double':
+        if precision=='gurobi':
             model.optimize()
             self.xopt = np.array([x.X for x in model.getVars()])
             self.x_dict = {x.VarName:x.X for x in model.getVars()}
@@ -385,11 +389,7 @@ class DecompModel(object):
     def qminos_solve(self, precision):
         csense_dict = {'=':'E', '<':'L', '>':'G'}
         model = self.model
-        if self.qsolver is None:
-            qsolver = QMINOS()
-            self.qsolver = qsolver
-        else:
-            qsolver = self.qsolver
+        qsolver = self.qsolver
 
         #if self.A is None:
         # Need to update every time for now
