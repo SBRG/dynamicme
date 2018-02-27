@@ -23,7 +23,7 @@ import warnings
 class Decomposer(object):
     def __init__(self, milp):
         self.milp = milp
-        self._INF = 1e6
+        self._INF = 1e3 # Not too big if multiplying with binary var.
         self._master = None
         self._sub = None
         self._A = None
@@ -104,6 +104,7 @@ class Decomposer(object):
 
         master.Params.Presolve = 0          # To be safe, turn off
         master.Params.LazyConstraints = 1   # Required to use cbLazy
+        master.Params.IntFeasTol = 1e-9
 
         return master
 
@@ -114,6 +115,7 @@ class Decomposer(object):
         """
         LB = -self._INF
         UB = self._INF
+        ZERO = 1e-12
         if self._x0 is None:
             self._split_constraints()
 
@@ -145,9 +147,9 @@ class Decomposer(object):
 
         # This dual constraint never changes
         # dual_cons = [sub.addConstr(sum([A[i,j]*wa[i] for i in range(m)]) + \
-        #            wl[j] - wu[j] == cx[j], name=xs0[j].VarName) for j in range(nx)]
+        #            wl[j] - wu[j] [<=>] cx[j], name=xs0[j].VarName) for j in range(nx)]
         # dual_cons = [sub.addConstr(
-        #     LinExpr(A[:,j].toarray().flat, wa) + wl[j] - wu[j] == cx[j]
+        #     LinExpr(A[:,j].toarray().flat, wa) + wl[j] - wu[j] [<=>] cx[j]
         #     ) for j in range(nx)]
 
         Acsc = self._Acsc
@@ -157,7 +159,18 @@ class Decomposer(object):
             coefs = Acsc.data[Acsc.indptr[j]:Acsc.indptr[j+1]]
             expr  = LinExpr(coefs, [wa[i] for i in rinds])
             #expr.addTerms([1., -1.], [wl[j], wu[j]])
-            cons  = sub.addConstr(expr+wl[j]-wu[j], GRB.EQUAL, cx[j], name=x0.VarName)
+            #cons  = sub.addConstr(expr+wl[j]-wu[j], GRB.EQUAL, cx[j], name=x0.VarName)
+            if x0.LB>=0 and x0.UB>=0:
+                csense = GRB.LESS_EQUAL
+            elif x0.LB<-ZERO and x0.UB>ZERO:
+                csense = GRB.EQUAL
+            elif x0.LB<-ZERO and x0.UB<=ZERO:
+                csense = GRB.GREATER_EQUAL
+            else:
+                print('Did not account for lb=%g and ub=%g'%(x0.LB,x0.UB))
+                raise ValueError
+
+            cons  = sub.addConstr(expr+wl[j]-wu[j], csense, cx[j], name=x0.VarName)
             dual_cons.append(cons)
 
         return sub

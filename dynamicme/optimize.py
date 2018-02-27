@@ -17,7 +17,7 @@ from cobra import Reaction, Metabolite, Model
 import copy
 import sys
 
-solver_apis = ['gurobi_solver', 'cplex_solver']
+solver_apis = ['gurobipy', 'cplex']
 
 for api in solver_apis:
     try:
