@@ -106,6 +106,8 @@ class Decomposer(object):
         master.Params.LazyConstraints = 1   # Required to use cbLazy
         master.Params.IntFeasTol = 1e-9
 
+        master.update()
+
         return master
 
     def make_sub(self):
@@ -115,7 +117,7 @@ class Decomposer(object):
         """
         LB = -self._INF
         UB = self._INF
-        ZERO = 1e-12
+        ZERO = 1e-15
         if self._x0 is None:
             self._split_constraints()
 
@@ -146,12 +148,6 @@ class Decomposer(object):
         self._wu = wu
 
         # This dual constraint never changes
-        # dual_cons = [sub.addConstr(sum([A[i,j]*wa[i] for i in range(m)]) + \
-        #            wl[j] - wu[j] [<=>] cx[j], name=xs0[j].VarName) for j in range(nx)]
-        # dual_cons = [sub.addConstr(
-        #     LinExpr(A[:,j].toarray().flat, wa) + wl[j] - wu[j] [<=>] cx[j]
-        #     ) for j in range(nx)]
-
         Acsc = self._Acsc
         dual_cons = []
         for j,x0 in enumerate(xs0):
@@ -172,6 +168,8 @@ class Decomposer(object):
 
             cons  = sub.addConstr(expr+wl[j]-wu[j], csense, cx[j], name=x0.VarName)
             dual_cons.append(cons)
+
+        sub.update()
 
         return sub
 
