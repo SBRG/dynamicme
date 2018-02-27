@@ -13,9 +13,11 @@
 from six import iteritems
 from builtins import range
 from scipy.sparse import coo_matrix, csr_matrix, csc_matrix
-from cobra.core.Solution import Solution
+from cobra.core import Solution
 from cobra import Reaction, Metabolite, Model
+from cobra import DictList
 from gurobipy import *
+from qminos.quadLP import QMINOS
 
 import numpy as np
 import warnings
@@ -101,6 +103,8 @@ class Decomposer(object):
 
         master._decomposer = self   # Need this reference to access methods inside callback
         master._verbosity = 0
+        master._gaptol = 1e-6
+        master._precision_sub = 'double'
 
         master.Params.Presolve = 0          # To be safe, turn off
         master.Params.LazyConstraints = 1   # Required to use cbLazy
@@ -171,7 +175,9 @@ class Decomposer(object):
 
         sub.update()
 
-        return sub
+        sub_wrapper = DecompModel(sub)
+
+        return sub_wrapper
 
     def update_subobj(self, yopt):
         sub = self._sub
@@ -199,6 +205,7 @@ class Decomposer(object):
         dBywa = LinExpr([dBy[j] for j in cinds], [wa[j] for j in cinds])
         obj = dBywa + LinExpr(xl,wl) - LinExpr(xu,wu)
         sub.setObjective(obj, GRB.MAXIMIZE)
+        sub.update()
 
     def make_optcut(self):
         z = self._z
@@ -211,9 +218,13 @@ class Decomposer(object):
         m = len(d)
         n = len(xl)
         ny = len(ys)
-        wa = np.array([w.X for w in self._wa])
-        wl = np.array([w.X for w in self._wl])
-        wu = np.array([w.X for w in self._wu])
+        #wa = np.array([w.X for w in self._wa])
+        #wl = np.array([w.X for w in self._wl])
+        #wu = np.array([w.X for w in self._wu])
+        wa = np.array([self._sub.x_dict[w.VarName] for w in self._wa])
+        wl = np.array([self._sub.x_dict[w.VarName] for w in self._wl])
+        wu = np.array([self._sub.x_dict[w.VarName] for w in self._wu])
+
         Bcsc = self._Bcsc
 
         # cut = z >= quicksum([fy[j]*ys[j] for j in range(ny)]) + \
@@ -235,9 +246,12 @@ class Decomposer(object):
         Instead, may need FarkasDuals for primal sub problem
         """
         # Get unbounded ray
-        wa = [w.X for w in self._wa]
-        wl = [w.X for w in self._wl]
-        wu = [w.X for w in self._wu]
+        # wa = [w.X for w in self._wa]
+        # wl = [w.X for w in self._wl]
+        # wu = [w.X for w in self._wu]
+        wa = np.array([self._sub.x_dict[w.VarName] for w in self._wa])
+        wl = np.array([self._sub.x_dict[w.VarName] for w in self._wl])
+        wu = np.array([self._sub.x_dict[w.VarName] for w in self._wu])
         ys = self._ys
         d = self._d
         B = self._B
@@ -330,3 +344,98 @@ def split_constraints(model):
     #B = csr_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny))
 
     return A, B, d, csenses, xs, ys
+
+
+class DecompModel(object):
+
+    def __init__(self, model):
+        self.model = model
+        self.qsolver = None
+        self.lp_basis = None
+        self.qp_basis = None
+        self.A = None
+        self.B = None
+        self.d = None
+        self.xs = None
+        self.ys = None
+        self.xl = None
+        self.xu = None
+        self.csense = None
+        self.ObjVal = None
+        self.x_dict = None
+
+    def ObjVal(self):
+        return self.ObjVal
+
+    def __getattr__(self, attr):
+        return getattr(self.model, attr)
+
+    # def __setattr__(self, name, value):
+    #     super(DecompModel, self).__setattr__(name, value)
+
+    def optimize(self, precision='double'):
+        model = self.model
+        if precision=='double':
+            model.optimize()
+            self.xopt = np.array([x.X for x in model.getVars()])
+            self.x_dict = {x.VarName:x.X for x in model.getVars()}
+        else:
+            self.qminos_solve(precision)
+
+    def qminos_solve(self, precision):
+        csense_dict = {'=':'E', '<':'L', '>':'G'}
+        model = self.model
+        if self.qsolver is None:
+            qsolver = QMINOS()
+            self.qsolver = qsolver
+        else:
+            qsolver = self.qsolver
+
+        #if self.A is None:
+        # Need to update every time for now
+        A,B,d,csenses0,xs,ys = split_constraints(model)
+        xl = np.array([x.LB for x in xs])
+        xu = np.array([x.UB for x in xs])
+        csenses = [csense_dict[sense] for sense in csenses0]
+        cx = np.array([x.OBJ for x in xs])
+        #     self.A = A
+        #     self.B = B
+        #     self.d = d
+        #     self.csenses = csenses
+        #     self.xs = xs
+        #     self.ys = ys
+        #     self.xl = [x.LB for x in xs]
+        #     self.ux = [x.UB for x in xs]
+        #     self.yl = [y.LB for y in ys]
+        #     self.yu = [y.UB for y in ys]
+        # A = self.A
+        # B = self.B
+        # d = self.d
+        # xl = self.xl
+        # xu = self.xu
+        # xs = self.xs
+        # ys = self.ys
+        self.cx = cx
+        self.xl = xl
+        self.xu = xu
+
+        if len(ys)>0:
+            yopt = [y.X for y in ys]
+            b = d - B*yopt
+        else:
+            b = d
+
+        basis = self.lp_basis
+
+        xall,stat,hs = qsolver.solvelp(A,b,cx,xl,xu,csenses,precision,basis=basis)
+        nx = len(cx)
+        xopt = xall[0:nx]
+
+        self.xopt = xopt
+        self.stat = stat
+        self.lp_basis = hs
+
+        self.ObjVal = sum(cx*xopt)
+        self.x_dict = {xj.VarName:xopt[j] for j,xj in enumerate(xs)}
+
+        # Translate qminos solution to original solver format

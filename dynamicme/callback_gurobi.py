@@ -15,7 +15,8 @@ from gurobipy import *
 
 
 def cb_benders(model, where):
-    GAPTOL = 1e-6
+    GAPTOL = model._gaptol
+    precision_sub = model._precision_sub
     try:
         decomposer = model._decomposer
     except AttributeError:
@@ -35,7 +36,7 @@ def cb_benders(model, where):
 
         decomposer.update_subobj(yopt)
         sub = decomposer.get_sub()
-        sub.optimize()
+        sub.optimize(precision=precision_sub)
 
         if sub.Status == GRB.Status.UNBOUNDED:
             # Add feasibility cut, ensuring that cut indeed eliminates current incumbent
