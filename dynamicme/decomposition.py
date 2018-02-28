@@ -291,61 +291,6 @@ class Decomposer(object):
         return self._master
 
 
-def split_constraints(model):
-    """
-    Splits constraints into continuous and integer parts:
-    Ax + By [<=>] d
-    """
-    constrs = model.getConstrs()
-    xs = [x for x in model.getVars() if x.VType == GRB.CONTINUOUS]
-    x_inds = {x:i for i,x in enumerate(xs)}
-    ys = [x for x in model.getVars() if x.VType in (GRB.INTEGER, GRB.BINARY)]
-    y_inds = {x:i for i,x in enumerate(ys)}
-    # Need to make index dictionary since __eq__ method of grb var 
-    # prevents use of list(vars).index(...)    
-    csenses = []
-    d = []
-
-    xdata = []
-    xrow_inds = []
-    xcol_inds = []
-
-    ydata = []
-    yrow_inds = []
-    ycol_inds = []
-
-    for row_idx, constr in enumerate(constrs):
-        csenses.append(constr.Sense)
-        d.append(constr.RHS)
-        row = model.getRow(constr)
-        for j in range(row.size()):
-            coeff = row.getCoeff(j)
-            vj = row.getVar(j)
-            if vj in x_inds:
-                col_idx = x_inds[vj]
-                xdata.append(coeff)
-                xcol_inds.append(col_idx)
-                xrow_inds.append(row_idx)
-            elif vj in y_inds:
-                col_idx = y_inds[vj]
-                ydata.append(coeff)
-                ycol_inds.append(col_idx)
-                yrow_inds.append(row_idx)
-            else:
-                print('vj should be in either x_inds or y_inds')
-                raise Exception('vj should be in either x_inds or y_inds')
-
-    M  = len(constrs)
-    nx = len(xs)
-    ny = len(ys)
-    A = coo_matrix((xdata, (xrow_inds, xcol_inds)), shape=(M,nx)).tocsr()
-    B = coo_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny)).tocsr()
-    #A = csr_matrix((xdata, (xrow_inds, xcol_inds)), shape=(M,nx))
-    #B = csr_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny))
-
-    return A, B, d, csenses, xs, ys
-
-
 class DecompModel(object):
 
     def __init__(self, model):
@@ -445,3 +390,63 @@ class DecompModel(object):
         self.x_dict = {xj.VarName:xopt[j] for j,xj in enumerate(xs)}
 
         # Translate qminos solution to original solver format
+
+
+# class MultiDecomposer(Decomposer):
+#     def make_submodels(self, mdl_ref, df_conds):
+#         """
+#         Generate multiple subproblems
+#         """
+
+
+def split_constraints(model):
+    """
+    Splits constraints into continuous and integer parts:
+    Ax + By [<=>] d
+    """
+    constrs = model.getConstrs()
+    xs = [x for x in model.getVars() if x.VType == GRB.CONTINUOUS]
+    x_inds = {x:i for i,x in enumerate(xs)}
+    ys = [x for x in model.getVars() if x.VType in (GRB.INTEGER, GRB.BINARY)]
+    y_inds = {x:i for i,x in enumerate(ys)}
+    # Need to make index dictionary since __eq__ method of grb var 
+    # prevents use of list(vars).index(...)    
+    csenses = []
+    d = []
+
+    xdata = []
+    xrow_inds = []
+    xcol_inds = []
+
+    ydata = []
+    yrow_inds = []
+    ycol_inds = []
+
+    for row_idx, constr in enumerate(constrs):
+        csenses.append(constr.Sense)
+        d.append(constr.RHS)
+        row = model.getRow(constr)
+        for j in range(row.size()):
+            coeff = row.getCoeff(j)
+            vj = row.getVar(j)
+            if vj in x_inds:
+                col_idx = x_inds[vj]
+                xdata.append(coeff)
+                xcol_inds.append(col_idx)
+                xrow_inds.append(row_idx)
+            elif vj in y_inds:
+                col_idx = y_inds[vj]
+                ydata.append(coeff)
+                ycol_inds.append(col_idx)
+                yrow_inds.append(row_idx)
+            else:
+                print('vj should be in either x_inds or y_inds')
+                raise Exception('vj should be in either x_inds or y_inds')
+
+    M  = len(constrs)
+    nx = len(xs)
+    ny = len(ys)
+    A = coo_matrix((xdata, (xrow_inds, xcol_inds)), shape=(M,nx)).tocsr()
+    B = coo_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny)).tocsr()
+
+    return A, B, d, csenses, xs, ys
