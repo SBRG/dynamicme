@@ -14,6 +14,7 @@ from six import iteritems
 from cobra.core.Solution import Solution
 from cobra import Reaction, Metabolite, Model
 
+import cobra
 import copy
 import sys
 
@@ -42,7 +43,7 @@ class Optimizer(object):
         self.mdl = mdl
         self.objective_sense = objective_sense
 
-    def add_duality_gap_constraint(self, clear_obj=False):
+    def add_duality_gap_constraint(self, clear_obj=False, index=None):
         """
         Add duality gap as a constraint to current model
         Inputs:
@@ -64,7 +65,10 @@ class Optimizer(object):
 
         #----------------------------------------------------
         # Add Primal variables and constraints
-        cons_gap = Constraint('duality_gap')
+        if index is None:
+            cons_gap = Constraint('duality_gap')
+        else:
+            cons_gap = Constraint('duality_gap_%s'%index)
         cons_gap._constraint_sense = 'E'
         cons_gap._bound = 0.
 
@@ -211,7 +215,6 @@ class Optimizer(object):
         #           wl, wu >= 0
         #           yij \in {0,1}
 
-
         for met_rxn, a12 in iteritems(a12_dict):
             met = met_rxn[0]
             rxn = met_rxn[1]
@@ -307,10 +310,11 @@ class Optimizer(object):
 
         return mdl
 
-    def stack_disjunctive(self, mdls):
+    def stack_disjunctive(self, mdl, a12_dict, cond_ids, M=1e4):
         """
         Stack models in mdls into disjunctive program.
         keff params are coupled by default
+        Binary variables shared across conditions
         """
         #   max     c'yi
         #   xk,wk,zk,yi
@@ -325,5 +329,202 @@ class Optimizer(object):
         #           wl, wu >= 0
         #           yij \in {0,1}
 
+        for mid_rid, a12 in iteritems(a12_dict):
+            mid = mid_rid[0]
+            rid = mid_rid[1]
+            a1  = a12[0]
+            a2  = a12[1]
+
+            # Binary variables shared
+            yij = Variable('binary_%s_%s'%(mid,rid))
+            yij.variable_kind = 'integer'
+            yij.lower_bound = 0.
+            yij.upper_bound = 1.
+            try:
+                mdl.add_reaction(yij)
+            except ValueError:
+                yij = mdl.reactions.get_by_id(yij.id)
+
+            # Z variables are condition-specific
+            for cid in cond_ids:
+                met = mdl.metabolites.get_by_id(mid+'_%s'%cid)
+                rxn = mdl.reactions.get_by_id(rid+'_%s'%cid)
+                zij = Variable('z_%s_%s'%(met.id,rxn.id))
+                zij.lower_bound = rxn.lower_bound
+                zij.upper_bound = rxn.upper_bound
+                try:
+                    mdl.add_reaction(zij)
+                except:
+                    zij = mdl.reactions.get_by_id(zij.id)
+                # Used to be:
+                #   sum_j aij*xj [<=>] bi
+                # Change to:
+                #   sum_j a1ij*xj - a1ij*zij + a2ij*zij [<=>] bi
+                rxn._metabolites[met] = a1
+                zij.add_metabolites({met:-a1+a2}, combine=False)
+                # Add: l*yij <= zij <= u*yij
+                cons_zl = Constraint('z_l_%s_%s'%(met.id,rxn.id))
+                cons_zl._constraint_sense = 'L'
+                cons_zl._bound = 0.
+                yij.add_metabolites({cons_zl:rxn.lower_bound}, combine=True)
+                zij.add_metabolites({cons_zl:-1.}, combine=False)
+                cons_zu = Constraint('z_u_%s_%s'%(met.id,rxn.id))
+                cons_zu._constraint_sense = 'L'
+                cons_zu._bound = 0.
+                yij.add_metabolites({cons_zu:-rxn.upper_bound}, combine=True)
+                zij.add_metabolites({cons_zu:1.}, combine=False)
+                # Add: -M*(1-yij) <= zij - xj <= M*(1-yij)
+                cons_zl = Constraint('z_M_l_%s_%s'%(met.id,rxn.id))
+                cons_zl._constraint_sense = 'L'
+                cons_zl._bound = M
+                rxn.add_metabolites({cons_zl:1.}, combine=False)
+                zij.add_metabolites({cons_zl:-1.}, combine=False)
+                yij.add_metabolites({cons_zl:M}, combine=True)
+                cons_zu = Constraint('z_M_u_%s_%s'%(met.id,rxn.id))
+                cons_zu._constraint_sense = 'L'
+                cons_zu._bound = M
+                rxn.add_metabolites({cons_zu:-1.}, combine=False)
+                zij.add_metabolites({cons_zu:1.}, combine=False)
+                yij.add_metabolites({cons_zu:M}, combine=True)
+                # Used to be:
+                # wa*A + wu - wl = c'
+                # Change to:
+                # sum_i a1ij*wai - a1ij*zaij + a2ij*zaij + wu - wl = cj
+                cons = mdl.metabolites.get_by_id(rxn.id)
+                wa = mdl.reactions.get_by_id('wa_'+met.id)
+                wl = mdl.reactions.get_by_id('wl_'+rxn.id)
+                wu = mdl.reactions.get_by_id('wu_'+rxn.id)
+                zaij = Variable('za_%s_%s'%(met.id,rxn.id))
+                zaij.lower_bound = wa.lower_bound
+                zaij.upper_bound = wa.upper_bound
+                try:
+                    mdl.add_reaction(zaij)
+                except ValueError:
+                    zaij = mdl.reactions.get_by_id(zaij.id)
+                wa._metabolites[cons] = a1
+                zaij.add_metabolites({cons:-a1+a2}, combine=False)
+                # wal*yij <= zaij <= wau*yij
+                cons_zl = Constraint('za_l_%s_%s'%(met.id,rxn.id))
+                cons_zl._constraint_sense = 'L'
+                cons_zl._bound = 0.
+                yij.add_metabolites({cons_zl:wa.lower_bound}, combine=True)
+                zaij.add_metabolites({cons_zl:-1.}, combine=False)
+                cons_zu = Constraint('za_u_%s_%s'%(met.id,rxn.id))
+                cons_zu._constraint_sense = 'L'
+                cons_zu._bound = 0.
+                yij.add_metabolites({cons_zu:-wa.upper_bound}, combine=True)
+                zaij.add_metabolites({cons_zu:1.}, combine=False)
+                # -M*(1-yij) <= zaij - wai <= M*(1-yij)
+                cons_zl = Constraint('za_M_l_%s_%s'%(met.id,rxn.id))
+                cons_zl._constraint_sense = 'L'
+                cons_zl._bound =  M
+                wa.add_metabolites({cons_zl:1.}, combine=False)
+                yij.add_metabolites({cons_zl:M}, combine=True)
+                zaij.add_metabolites({cons_zl:-1.}, combine=False)
+                cons_zu = Constraint('za_M_u_%s_%s'%(met.id,rxn.id))
+                cons_zu._constraint_sense = 'L'
+                cons_zu._bound = M
+                wa.add_metabolites({cons_zu:-1.}, combine=False)
+                yij.add_metabolites({cons_zu:M}, combine=True)
+                zaij.add_metabolites({cons_zu:1.}, combine=False)
+
+        return mdl
 
 
+class ObservedModel(cobra.core.Model):
+    def __init__(self, observer, *args, **kwargs):
+        self.observer = observer
+        super(ObservedModel, self).__init__(*args, **kwargs)
+
+    def add_reaction(self, rxn):
+        # Update observer first
+        self.observer.add_reaction(rxn)
+        # Then, call base method
+        super(ObservedModel, self).add_reaction(rxn)
+
+    def add_reactions(self, rxns):
+        # Update observer first
+        self.observer.add_reactions(rxns)
+        # Then, call base method
+        super(ObservedModel, self).add_reactions(rxns)
+
+    def add_metabolites(self, mets):
+        # Update observer first
+        self.observer.add_metabolites(mets)
+        # Then, call base method
+        super(ObservedModel, self).add_metabolites(mets)
+
+
+class StackOptimizer(object):
+    def __init__(self):
+        self.model_dict = {}
+        self.model = None
+
+    def update(self):
+        """
+        Update stacked model with updates to individual models
+        """
+        for k,mdl in iteritems(self.model_dict):
+            pass
+
+
+    def stack_models(self, mdl_ref, df_conds):
+        """
+        Stack models according to data frame
+        Also keep some reference to each condition-specific model
+
+        Inputs:
+        mdl_ref : reference model
+        df_conds : dataframe of conditions with columns:
+            cond rxn lb ub obj
+        """
+        stacked_model = Model('stacked')
+        conds = df_conds.cond.unique()
+
+        for cind,cond in enumerate(conds):
+            dfi = df_conds[ df_conds.cond==cond]
+            # Create clone of reference model
+            suffix = '_%s'%cond
+            mdli = clone_model(mdl_ref, stacked_model, suffix=suffix)
+            # Modify its lb, ub
+            for i,row in dfi.iterrows():
+                rxn = mdli.reactions.get_by_id(row['rxn']+suffix)
+                rxn.lower_bound = row['lb']
+                rxn.upper_bound = row['ub']
+                rxn.objective_coefficient = row['obj']
+
+            self.model_dict[cond] = mdli
+
+        self.model = stacked_model
+
+
+def clone_model(model, observer, suffix=''):
+    clone  = ObservedModel(observer, model.id)
+    rxns = [Reaction(rxn.id+suffix, rxn.name, rxn.subsystem,
+        rxn.lower_bound, rxn.upper_bound, rxn.objective_coefficient) for
+        rxn in model.reactions]
+    mets = [Metabolite(met.id+suffix, met.formula, met.name, met.charge, met.compartment) for
+            met in model.metabolites]
+    clone.add_reactions(rxns)
+    clone.add_metabolites(mets)
+
+    unique_rxn_attrs = ['_model','id','_metabolites','_genes']
+    unique_met_attrs = ['_model','id','_reaction']
+
+    # Add properties and stoich
+    for rxn0 in model.reactions:
+        rxn = clone.reactions.get_by_id(rxn0.id+suffix)
+        for k,v in iteritems(rxn0.__dict__):
+            if k not in unique_rxn_attrs:
+                rxn.__dict__[k] = v
+
+        stoich = {m.id+suffix:s for m,s in iteritems(rxn0.metabolites)}
+        rxn.add_metabolites(stoich)
+
+    for met0 in model.metabolites:
+        met = clone.metabolites.get_by_id(met0.id+suffix)
+        for k,v in iteritems(met0.__dict__):
+            if k not in unique_met_attrs:
+                met.__dict__[k] = v
+
+    return clone

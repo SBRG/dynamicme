@@ -365,11 +365,16 @@ class DecompModel(object):
         self.xl = None
         self.xu = None
         self.csense = None
-        self.ObjVal = None
+        self._ObjVal = None
         self.x_dict = None
 
+    @property
     def ObjVal(self):
-        return self.ObjVal
+        return self._ObjVal
+
+    @ObjVal.setter
+    def ObjVal(self, value):
+        self._ObjVal = value
 
     def __getattr__(self, attr):
         return getattr(self.model, attr)
@@ -383,6 +388,7 @@ class DecompModel(object):
             model.optimize()
             self.xopt = np.array([x.X for x in model.getVars()])
             self.x_dict = {x.VarName:x.X for x in model.getVars()}
+            self.ObjVal = model.ObjVal
         else:
             self.qminos_solve(precision)
 
