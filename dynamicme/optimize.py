@@ -14,6 +14,7 @@ from six import iteritems
 from cobra.core.Solution import Solution
 from cobra import Reaction, Metabolite, Model
 
+import numpy as np
 import cobra
 import copy
 import sys
@@ -43,10 +44,11 @@ class Optimizer(object):
         self.mdl = mdl
         self.objective_sense = objective_sense
 
-    def add_duality_gap_constraint(self, clear_obj=False, index=None):
+    def add_duality_gap_constraint(self, primal_sense='max', clear_obj=False, index=None, INF=1e3):
         """
         Add duality gap as a constraint to current model
         Inputs:
+        primal_sense : 'max' or 'min
         clear_obj : clear the new model's objective function
         """
         #   max     c'x
@@ -60,7 +62,7 @@ class Optimizer(object):
         #           wa \in R if ai*x == bi
 
         primal  = self.mdl
-        dual = self.make_dual()
+        dual = self.make_dual(LB=-INF, UB=INF, primal_sense=primal_sense)
         mdl = Model('duality_gap')
 
         #----------------------------------------------------
@@ -75,26 +77,20 @@ class Optimizer(object):
         for rxn in primal.reactions:
             var = Variable(rxn.id)
             mdl.add_reaction(var)
-            var.lower_bound = rxn.lower_bound
-            var.upper_bound = rxn.upper_bound
-            var.objective_coefficient = rxn.objective_coefficient
+            clone_attributes(rxn, var)
             for met,s in iteritems(rxn.metabolites):
                 cons = Constraint(met.id)
-                cons._constraint_sense = met._constraint_sense
-                cons._bound = met._bound
+                clone_attributes(met, cons)
                 var.add_metabolites({cons:s})
 
             # Add duality gap, dual variables, and dual constraints
             if rxn.objective_coefficient != 0:
                 var.add_metabolites({cons_gap:rxn.objective_coefficient})
 
-
         for rxn in dual.reactions:
             dvar = Variable(rxn.id)
             mdl.add_reaction(dvar)
-            dvar.lower_bound = rxn.lower_bound
-            dvar.upper_bound = rxn.upper_bound
-            dvar.objective_coefficient = rxn.objective_coefficient
+            clone_attributes(rxn, dvar)
             dvar.add_metabolites({cons_gap:-rxn.objective_coefficient})
 
         #----------------------------------------------------
@@ -109,7 +105,7 @@ class Optimizer(object):
 
         return mdl
 
-    def make_dual(self, LB=-1000, UB=1000):
+    def make_dual(self, LB=-1000, UB=1000, primal_sense='max'):
         """
         Return dual of current model
         """
@@ -131,14 +127,27 @@ class Optimizer(object):
         for met in mdl.metabolites:
             wa = Variable('wa_'+met.id)
             wa_dict[met.id] = wa
-            if met._constraint_sense == 'E':
-                wa.lower_bound = LB
-            else:
-                wa.lower_bound = 0.
-            if met._constraint_sense == 'G':
-                wa.objective_coefficient = -met._bound
-            else:
-                wa.objective_coefficient = met._bound
+            wa.objective_coefficient = met._bound
+            if primal_sense == 'max':
+                if met._constraint_sense == 'E':
+                    wa.lower_bound = LB
+                    wa.upper_bound = UB
+                elif met._constraint_sense == 'L':
+                    wa.lower_bound = 0.
+                    wa.upper_bound = UB
+                elif met._constraint_sense == 'G':
+                    wa.lower_bound = LB
+                    wa.upper_bound = 0.
+            elif primal_sense == 'min':
+                if met._constraint_sense == 'E':
+                    wa.lower_bound = LB
+                    wa.upper_bound = UB
+                elif met._constraint_sense == 'G':
+                    wa.lower_bound = 0.
+                    wa.upper_bound = UB
+                elif met._constraint_sense == 'L':
+                    wa.lower_bound = LB
+                    wa.upper_bound = 0.
         dual.add_reactions(wa_dict.values())
 
         wl_dict = {}
@@ -150,31 +159,196 @@ class Optimizer(object):
             wu.lower_bound = 0.
             wl_dict[rxn.id] = wl
             wu_dict[rxn.id] = wu
-            wl.objective_coefficient = -rxn.lower_bound
-            wu.objective_coefficient = rxn.upper_bound
+            if primal_sense=='max':
+                wl.objective_coefficient = -rxn.lower_bound
+                wu.objective_coefficient = rxn.upper_bound
+            elif primal_sense=='min':
+                wl.objective_coefficient = rxn.lower_bound
+                wu.objective_coefficient = -rxn.upper_bound
 
-            #cons = Constraint('cons_'+rxn.id)
             cons = Constraint(rxn.id)
-            if rxn.lower_bound < 0:
-                cons._constraint_sense = 'E'
-            else:
-                cons._constraint_sense = 'G'
+            if primal_sense=='max':
+                if rxn.lower_bound<0 and rxn.upper_bound>0:
+                    cons._constraint_sense = 'E'
+                elif rxn.lower_bound==0 and rxn.upper_bound>0:
+                    cons._constraint_sense = 'G'
+                elif rxn.lower_bound<0 and rxn.upper_bound<=0:
+                    cons._constraint_sense = 'L'
+            elif primal_sense=='min':
+                if rxn.lower_bound<0 and rxn.upper_bound>0:
+                    cons._constraint_sense = 'E'
+                elif rxn.lower_bound==0 and rxn.upper_bound>0:
+                    cons._constraint_sense = 'L'
+                elif rxn.lower_bound<0 and rxn.upper_bound<=0:
+                    cons._constraint_sense = 'G'
+
             cons._bound = rxn.objective_coefficient
-            wl.add_metabolites({cons:-1.})
-            wu.add_metabolites({cons:1.})
+
+            if primal_sense=='max':
+                wl.add_metabolites({cons:-1.})
+                wu.add_metabolites({cons:1.})
+            elif primal_sense=='min':
+                wl.add_metabolites({cons:1.})
+                wu.add_metabolites({cons:-1.})
 
             for met,s in iteritems(rxn.metabolites):
                 wa = wa_dict[met.id]
-                if met._constraint_sense == 'G':
-                    wa.add_metabolites({cons:-s})
-                else:
-                    wa.add_metabolites({cons:s})
+                wa.add_metabolites({cons:s})
 
         # Remember to minimize the problem
         dual.add_reactions(wl_dict.values())
         dual.add_reactions(wu_dict.values())
 
         return dual
+
+    def to_radix(self, mdl, var_cons_dict, radix, powers, num_digits_per_power,
+            radix_multiplier=1., M=1e3):
+        """
+        Given sum_j ai*xj = di,
+        discretize ai into radix form, adding necessary constraints.
+
+        Inputs
+        var_cons_dict : dict of group_id: (var, cons, coeff0) tuples that share the same coefficient
+
+        """
+        pwr_min = min(powers)
+        pwr_max = max(powers)
+        digits  = np.linspace(0, pwr_max-1, num_digits_per_power)
+
+        # All var, cons pairs in var_cons_pairs list share the same binary variables
+
+        for group_id, var_cons_coeff in iteritems(var_cons_dict):
+            for l,pwr in enumerate(powers):
+                for k,digit in enumerate(digits):
+                    y_klj = Variable('binary_%s%s%s'%(group_id,k,l))
+                    y_klj.variable_kind = 'integer'
+                    y_klj.lower_bound = 0.
+                    y_klj.upper_bound = 1.
+                    try:
+                        mdl.add_reaction(y_klj)
+                    except ValueError:
+                        y_klj = mdl.reactions.get_by_id(y_klj.id)
+
+                    for rxn, cons, a0 in var_cons_coeff:
+                        # Remove the old column in this constraint
+                        if rxn.metabolites.has_key(cons):
+                            rxn.subtract_metabolites({cons:rxn.metabolites[cons]})
+
+                        rid = rxn.id
+                        cid = cons.id
+                        z_klj = Variable('z_%s_%s%s%s'%(rid,cid,k,l))
+                        mdl.add_reaction(z_klj)
+
+                        # try:
+                        #     mdl.add_reaction(z_klj)
+                        # except ValueError:
+                        #     z_klj = mdl.reactions.get_by_id(z_klj.id)
+
+                        coeff = radix**pwr * digit * a0
+                        z_klj.add_metabolites({cons:coeff})
+                        cons_zdiff_L = Constraint('zdiff_L_%s_%s%s%s'%(rid,cid,k,l))
+                        cons_zdiff_L._constraint_sense = 'L'
+                        cons_zdiff_L._bound = M
+                        cons_zdiff_U = Constraint('zdiff_U_%s_%s%s%s'%(rid,cid,k,l))
+                        cons_zdiff_U._constraint_sense = 'L'
+                        cons_zdiff_U._bound = M
+
+                        z_klj.add_metabolites({cons_zdiff_L:-1.})
+                        y_klj.add_metabolites({cons_zdiff_L:M})
+                        rxn.add_metabolites({cons_zdiff_L:1.})
+
+                        z_klj.add_metabolites({cons_zdiff_U:1.})
+                        y_klj.add_metabolites({cons_zdiff_U:M})
+                        rxn.add_metabolites({cons_zdiff_U:-1.})
+
+                        cons_z_L = Constraint('z_L_%s_%s%s%s'%(rid,cid,k,l))
+                        cons_z_L._constraint_sense = 'L'
+                        cons_z_L._bound = 0.
+                        cons_z_U = Constraint('z_U_%s_%s%s%s'%(rid,cid,k,l))
+                        cons_z_U._constraint_sense = 'L'
+                        cons_z_U._bound = 0.
+
+                        z_klj.add_metabolites({cons_z_L:-1.})
+                        y_klj.add_metabolites({cons_z_L:rxn.lower_bound})
+                        z_klj.add_metabolites({cons_z_U:1.})
+                        y_klj.add_metabolites({cons_z_U:-rxn.upper_bound})
+
+
+    def add_crowding_radix(self, mdl, crowding_bound, crowding_dict,
+            radix, powers, num_digits_per_power,
+            radix_multiplier=1., crowding_sense='L', M=1e3):
+        """
+        Formulate radix-based discretization of estimated parameters
+        Inputs
+        crowding_dict : dict of {rxn: a0 (nominal parameter value)}
+        """
+        # sum a0j sum_{l=p:P} sum_{k=0:R-1} a0*R^l*k*z_{klj} <= C
+        # -M*(1-y_klj) <= z_klj - xj <= M*(1-y_klj)
+        # xlj*y_klj <= z_klj <= xuj*y_klj
+        pwr_min = min(powers)
+        pwr_max = max(powers)
+        digits  = np.linspace(0, pwr_max-1, num_digits_per_power)
+
+        crowding = Constraint('crowding_radix')
+        crowding._bound = crowding_bound
+        crowding._constraint_sense = crowding_sense
+
+        mdl.add_metabolites(crowding)
+
+        for rxn,a0 in iteritems(crowding_dict):
+            if not isinstance(rxn,Reaction):
+                rxn = mdl.reactions.get_by_id(rxn)
+            rid = rxn.id
+
+            for l,pwr in enumerate(powers):
+                for k,digit in enumerate(digits):
+                    y_klj = Variable('binary_%s%s%s'%(rid,k,l))
+                    y_klj.variable_kind = 'integer'
+                    y_klj.lower_bound = 0.
+                    y_klj.upper_bound = 1.
+                    try:
+                        mdl.add_reaction(y_klj)
+                    except ValueError:
+                        y_klj = mdl.reactions.get_by_id(y_klj.id)
+
+                    z_klj = Variable('z_%s%s%s'%(rid,k,l))
+                    try:
+                        mdl.add_reaction(z_klj)
+                    except ValueError:
+                        z_klj = mdl.reactions.get_by_id(z_klj.id)
+
+                    coeff = radix**pwr * digit * a0
+                    z_klj.add_metabolites({crowding:coeff})
+                    cons_zdiff_L = Constraint('zdiff_L_%s%s%s'%(rid,k,l))
+                    cons_zdiff_L._constraint_sense = 'L'
+                    cons_zdiff_L._bound = M
+                    cons_zdiff_U = Constraint('zdiff_U_%s%s%s'%(rid,k,l))
+                    cons_zdiff_U._constraint_sense = 'L'
+                    cons_zdiff_U._bound = M
+
+                    z_klj.add_metabolites({cons_zdiff_L:-1.})
+                    y_klj.add_metabolites({cons_zdiff_L:M})
+                    rxn.add_metabolites({cons_zdiff_L:1.})
+
+                    z_klj.add_metabolites({cons_zdiff_U:1.})
+                    y_klj.add_metabolites({cons_zdiff_U:M})
+                    rxn.add_metabolites({cons_zdiff_U:-1.})
+
+                    cons_z_L = Constraint('z_L_%s%s%s'%(rid,k,l))
+                    cons_z_L._constraint_sense = 'L'
+                    cons_z_L._bound = 0.
+                    cons_z_U = Constraint('z_U_%s%s%s'%(rid,k,l))
+                    cons_z_U._constraint_sense = 'L'
+                    cons_z_U._bound = 0.
+
+                    z_klj.add_metabolites({cons_z_L:-1.})
+                    y_klj.add_metabolites({cons_z_L:rxn.lower_bound})
+                    z_klj.add_metabolites({cons_z_U:1.})
+                    y_klj.add_metabolites({cons_z_U:-rxn.upper_bound})
+
+        # sum a0j sum_{l=p:P} sum_{k=0:R-1} a0*R^l*k*z_{klj} <= C
+        # -M*(1-y_klj) <= z_klj - xj <= M*(1-y_klj)
+        # xlj*y_klj <= z_klj <= xuj*y_klj
 
 
     def make_disjunctive_primal_dual(self, mdl, a12_dict, M=1e4):
@@ -496,6 +670,21 @@ class StackOptimizer(object):
             self.model_dict[cond] = mdli
 
         self.model = stacked_model
+
+def clone_attributes(orig, clone):
+    unique_rxn_attrs = ['_model','id','_metabolites','_genes']
+    unique_met_attrs = ['_model','id','_reaction']
+
+    if isinstance(orig,Reaction):
+        for k,v in iteritems(orig.__dict__):
+            if k not in unique_rxn_attrs:
+                clone.__dict__[k] = v
+    elif isinstance(orig,Metabolite):
+        for k,v in iteritems(orig.__dict__):
+            if k not in unique_met_attrs:
+                clone.__dict__[k] = v
+    else:
+        raise ValueError("Type of original must be Reaction or Metabolite")
 
 
 def clone_model(model, observer, suffix=''):
