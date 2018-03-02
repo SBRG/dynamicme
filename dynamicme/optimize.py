@@ -213,7 +213,7 @@ class Optimizer(object):
         """
         pwr_min = min(powers)
         pwr_max = max(powers)
-        digits  = np.linspace(0, pwr_max-1, num_digits_per_power)
+        digits  = np.linspace(0, radix-1, num_digits_per_power)
 
         # All var, cons pairs in var_cons_pairs list share the same binary variables
 
@@ -238,11 +238,6 @@ class Optimizer(object):
                         cid = cons.id
                         z_klj = Variable('z_%s_%s%s%s'%(rid,cid,k,l))
                         mdl.add_reaction(z_klj)
-
-                        # try:
-                        #     mdl.add_reaction(z_klj)
-                        # except ValueError:
-                        #     z_klj = mdl.reactions.get_by_id(z_klj.id)
 
                         coeff = radix**pwr * digit * a0
                         z_klj.add_metabolites({cons:coeff})
@@ -287,7 +282,7 @@ class Optimizer(object):
         # xlj*y_klj <= z_klj <= xuj*y_klj
         pwr_min = min(powers)
         pwr_max = max(powers)
-        digits  = np.linspace(0, pwr_max-1, num_digits_per_power)
+        digits  = np.linspace(0, radix-1, num_digits_per_power)
 
         crowding = Constraint('crowding_radix')
         crowding._bound = crowding_bound
