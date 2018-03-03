@@ -44,7 +44,8 @@ def cb_benders(model, where):
             model.cbLazy(feascut)
         else:
             zsub = decomposer.calc_sub_objval(yopt)
-            gap = zmaster - zsub
+            #gap = zmaster - zsub
+            gap = zsub - zmaster    # UB - LB
 
             if model._verbosity > 0:
                 print('#'*40)
@@ -96,7 +97,8 @@ def cb_benders_multi(model, where):
                 zsub = decomposer.calc_sub_objval(yopt)
                 zsubs.append(zsub)
 
-                gap = zmaster - zsub
+                #gap = zmaster - zsub
+                gap = zsub - zmaster    # UB - LB
 
                 if model._verbosity > 0:
                     print('#'*40)

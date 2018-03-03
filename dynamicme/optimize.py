@@ -215,46 +215,72 @@ class Optimizer(object):
         pwr_max = max(powers)
         digits  = np.linspace(0, radix-1, num_digits_per_power)
 
-        # All var, cons pairs in var_cons_pairs list share the same binary variables
+        # Add new rows and columns at once at the end to save time
+        # new_mets = set()
+        # new_rxns = set()
 
+        # All var, cons pairs in var_cons_pairs list share the same binary variables
         for group_id, var_cons_coeff in iteritems(var_cons_dict):
             for l,pwr in enumerate(powers):
                 for k,digit in enumerate(digits):
-                    y_klj = Variable('binary_%s%s%s'%(group_id,k,l))
-                    y_klj.variable_kind = 'integer'
-                    y_klj.lower_bound = 0.
-                    y_klj.upper_bound = 1.
-                    try:
+                    yid = 'binary_%s%s%s'%(group_id,k,l)
+                    if mdl.reactions.has_id(yid):
+                        y_klj = mdl.reactions.get_by_id(yid)
+                    else:
+                        y_klj = Variable(yid)
+                        y_klj.variable_kind = 'integer'
+                        y_klj.lower_bound = 0.
+                        y_klj.upper_bound = 1.
                         mdl.add_reaction(y_klj)
-                    except ValueError:
-                        y_klj = mdl.reactions.get_by_id(y_klj.id)
+                        #new_rxns.add(y_klj)
 
                     for rxn, cons, a0 in var_cons_coeff:
                         # Remove the old column in this constraint
-                        if rxn.metabolites.has_key(cons):
-                            rxn.subtract_metabolites({cons:rxn.metabolites[cons]})
+                        if rxn.metabolites.has_key(cons):   # slow 1
+                            #rxn.subtract_metabolites({cons:rxn.metabolites[cons]})
+                            rxn._metabolites.pop(cons)
+                            cons._reaction.remove(rxn)
 
                         rid = rxn.id
                         cid = cons.id
                         z_klj = Variable('z_%s_%s%s%s'%(rid,cid,k,l))
-                        mdl.add_reaction(z_klj)
+                        mdl.add_reaction(z_klj) # slow 3
+                        #new_rxns.add(z_klj)
 
                         coeff = radix**pwr * digit * a0
-                        z_klj.add_metabolites({cons:coeff})
+                        # z_klj.add_metabolites({cons:coeff})
+                        z_klj._metabolites[cons] = coeff
+                        cons._reaction.add(z_klj)
+
                         cons_zdiff_L = Constraint('zdiff_L_%s_%s%s%s'%(rid,cid,k,l))
                         cons_zdiff_L._constraint_sense = 'L'
                         cons_zdiff_L._bound = M
                         cons_zdiff_U = Constraint('zdiff_U_%s_%s%s%s'%(rid,cid,k,l))
                         cons_zdiff_U._constraint_sense = 'L'
                         cons_zdiff_U._bound = M
+                        mdl.add_metabolites([cons_zdiff_L, cons_zdiff_U])   # slow 2
+                        #new_mets.add(cons_zdiff_L)
+                        #new_mets.add(cons_zdiff_U)
 
-                        z_klj.add_metabolites({cons_zdiff_L:-1.})
-                        y_klj.add_metabolites({cons_zdiff_L:M})
-                        rxn.add_metabolites({cons_zdiff_L:1.})
+                        #z_klj.add_metabolites({cons_zdiff_L:-1.})
+                        z_klj._metabolites[cons_zdiff_L] = -1.
+                        cons_zdiff_L._reaction.add(z_klj)
+                        #y_klj.add_metabolites({cons_zdiff_L:M})
+                        y_klj._metabolites[cons_zdiff_L] = M
+                        cons_zdiff_L._reaction.add(y_klj)
+                        #rxn.add_metabolites({cons_zdiff_L:1.}) # too slow
+                        rxn._metabolites[cons_zdiff_L] = 1.
+                        cons_zdiff_L._reaction.add(rxn)
 
-                        z_klj.add_metabolites({cons_zdiff_U:1.})
-                        y_klj.add_metabolites({cons_zdiff_U:M})
-                        rxn.add_metabolites({cons_zdiff_U:-1.})
+                        #z_klj.add_metabolites({cons_zdiff_U:1.})
+                        z_klj._metabolites[cons_zdiff_U] = 1.
+                        cons_zdiff_U._reaction.add(z_klj)
+                        #y_klj.add_metabolites({cons_zdiff_U:M})
+                        y_klj._metabolites[cons_zdiff_U] = M
+                        cons_zdiff_U._reaction.add(y_klj)
+                        # rxn.add_metabolites({cons_zdiff_U:-1.}) # too slow
+                        rxn._metabolites[cons_zdiff_U] = -1.
+                        cons_zdiff_U._reaction.add(rxn)
 
                         cons_z_L = Constraint('z_L_%s_%s%s%s'%(rid,cid,k,l))
                         cons_z_L._constraint_sense = 'L'
@@ -262,11 +288,25 @@ class Optimizer(object):
                         cons_z_U = Constraint('z_U_%s_%s%s%s'%(rid,cid,k,l))
                         cons_z_U._constraint_sense = 'L'
                         cons_z_U._bound = 0.
+                        mdl.add_metabolites([cons_z_L, cons_z_U])   # slow 2
+                        # new_mets.add(cons_z_L)
+                        # new_mets.add(cons_z_U)
 
-                        z_klj.add_metabolites({cons_z_L:-1.})
-                        y_klj.add_metabolites({cons_z_L:rxn.lower_bound})
-                        z_klj.add_metabolites({cons_z_U:1.})
-                        y_klj.add_metabolites({cons_z_U:-rxn.upper_bound})
+                        #z_klj.add_metabolites({cons_z_L:-1.})
+                        z_klj._metabolites[cons_z_L]=-1.
+                        cons_z_L._reaction.add(z_klj)
+                        #y_klj.add_metabolites({cons_z_L:rxn.lower_bound})
+                        y_klj._metabolites[cons_z_L]=rxn.lower_bound
+                        cons_z_L._reaction.add(y_klj)
+                        #z_klj.add_metabolites({cons_z_U:1.})
+                        z_klj._metabolites[cons_z_U]=1.
+                        cons_z_U._reaction.add(z_klj)
+                        #y_klj.add_metabolites({cons_z_U:-rxn.upper_bound})
+                        y_klj._metabolites[cons_z_U]=-rxn.upper_bound
+                        cons_z_U._reaction.add(y_klj)
+
+        # mdl.add_reactions(new_rxns)
+        # mdl.add_metabolites(new_mets)
 
 
     def add_crowding_radix(self, mdl, crowding_bound, crowding_dict,
