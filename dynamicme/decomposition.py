@@ -341,6 +341,13 @@ class DecompModel(object):
         csense_dict = {'=':'E', '<':'L', '>':'G'}
         model = self.model
         qsolver = self.qsolver
+        obj_sense = model.ModelSense
+        if obj_sense==GRB.MAXIMIZE:
+            obj_sense_str = 'Maximize'
+        else:
+            obj_sense_str = 'Minimize'
+        for alg in ['lp','lp_d','lp_q2']:
+            qsolver.opt_strlist[alg][0] = obj_sense_str
 
         #if self.A is None:
         # Need to update every time for now

@@ -201,19 +201,23 @@ class Optimizer(object):
 
         return dual
 
-    def to_radix(self, mdl, var_cons_dict, radix, powers, num_digits_per_power,
-            radix_multiplier=1., M=1e3):
+    def to_radix(self, mdl, var_cons_dict, radix, powers,
+            num_digits_per_power=None, digits=None,
+            radix_multiplier=1., M=1e3, prevent_zero=False):
         """
         Given sum_j ai*xj = di,
         discretize ai into radix form, adding necessary constraints.
 
         Inputs
         var_cons_dict : dict of group_id: (var, cons, coeff0) tuples that share the same coefficient
+        prevent_zero : prevent radix-based value from becoming zero
 
         """
         pwr_min = min(powers)
         pwr_max = max(powers)
-        digits  = np.linspace(0, radix-1, num_digits_per_power)
+        if digits is None:
+            # Don't need to start with k=0 since you get it with y_kl=0
+            digits  = np.linspace(1, radix-1, num_digits_per_power)
 
         # Add new rows and columns at once at the end to save time
         # new_mets = set()
@@ -304,6 +308,22 @@ class Optimizer(object):
                         #y_klj.add_metabolites({cons_z_U:-rxn.upper_bound})
                         y_klj._metabolites[cons_z_U]=-rxn.upper_bound
                         cons_z_U._reaction.add(y_klj)
+
+
+        if prevent_zero:
+            # sum_kl y_groupi >= 1
+            for group_id, var_cons_coeff in iteritems(var_cons_dict):
+                cons = Constraint('force_nonzero_%s'%group_id)
+                cons._bound = 0.9 # 1
+                cons._constraint_sense = 'G'
+                mdl.add_metabolites(cons)
+
+                for l,pwr in enumerate(powers):
+                    for k,digit in enumerate(digits):
+                        yid = 'binary_%s%s%s'%(group_id,k,l)
+                        y_klj = mdl.reactions.get_by_id(yid)
+                        y_klj._metabolites[cons] = 1.
+                        cons._reaction.add(y_klj)
 
         # mdl.add_reactions(new_rxns)
         # mdl.add_metabolites(new_mets)
