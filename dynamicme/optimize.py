@@ -44,7 +44,8 @@ class Optimizer(object):
         self.mdl = mdl
         self.objective_sense = objective_sense
 
-    def add_duality_gap_constraint(self, primal_sense='max', clear_obj=False, index=None, INF=1e3):
+    def add_duality_gap_constraint(self, primal_sense='max', clear_obj=False, index=None,
+            INF=1e3, inplace=True):
         """
         Add duality gap as a constraint to current model
         Inputs:
@@ -62,8 +63,11 @@ class Optimizer(object):
         #           wa \in R if ai*x == bi
 
         primal  = self.mdl
-        dual = self.make_dual(LB=-INF, UB=INF, primal_sense=primal_sense)
-        mdl = Model('duality_gap')
+        dual = self.make_dual(primal, LB=-INF, UB=INF, primal_sense=primal_sense)
+        if inplace:
+            mdl = self.mdl
+        else:
+            mdl = Model('duality_gap')
 
         #----------------------------------------------------
         # Add Primal variables and constraints
@@ -73,19 +77,27 @@ class Optimizer(object):
             cons_gap = Constraint('duality_gap_%s'%index)
         cons_gap._constraint_sense = 'E'
         cons_gap._bound = 0.
+        mdl.add_metabolites(cons_gap)
 
-        for rxn in primal.reactions:
-            var = Variable(rxn.id)
-            mdl.add_reaction(var)
-            clone_attributes(rxn, var)
-            for met,s in iteritems(rxn.metabolites):
-                cons = Constraint(met.id)
-                clone_attributes(met, cons)
-                var.add_metabolites({cons:s})
-
+        if not inplace:
+            primal_reactions = primal.reactions.copy()
+            for rxn in primal.reactions:
+                var = Variable(rxn.id)
+                mdl.add_reaction(var)
+                clone_attributes(rxn, var)
+                for met,s in iteritems(rxn.metabolites):
+                    cons = Constraint(met.id)
+                    clone_attributes(met, cons)
+                    var.add_metabolites({cons:s})
             # Add duality gap, dual variables, and dual constraints
             if rxn.objective_coefficient != 0:
                 var.add_metabolites({cons_gap:rxn.objective_coefficient})
+
+        else:
+            for rxn in mdl.reactions:
+                # Add duality gap, dual variables, and dual constraints
+                if rxn.objective_coefficient != 0:
+                    rxn.add_metabolites({cons_gap:rxn.objective_coefficient})
 
         for rxn in dual.reactions:
             dvar = Variable(rxn.id)
@@ -99,17 +111,17 @@ class Optimizer(object):
             cons_dual = Constraint(met.id)
             cons_dual._constraint_sense = met._constraint_sense
             cons_dual._bound = met._bound
+            mdl.add_metabolites(cons_dual)
             for rxn in met.reactions:
                 dvar = mdl.reactions.get_by_id(rxn.id)
                 dvar.add_metabolites({cons_dual:rxn.metabolites[met]})
 
         return mdl
 
-    def make_dual(self, LB=-1000, UB=1000, primal_sense='max'):
+    def make_dual(self, mdl, LB=-1000, UB=1000, primal_sense='max'):
         """
         Return dual of current model
         """
-        mdl  = self.mdl
         objective_sense=self.objective_sense
         dual = Model('dual')
         # Primal:
@@ -665,11 +677,12 @@ class ObservedModel(cobra.core.Model):
         self.observer = observer
         super(ObservedModel, self).__init__(*args, **kwargs)
 
-    def add_reaction(self, rxn):
-        # Update observer first
-        self.observer.add_reaction(rxn)
-        # Then, call base method
-        super(ObservedModel, self).add_reaction(rxn)
+#   Calls add_reactions, so no need
+#     def add_reaction(self, rxn):
+#         # Update observer first
+#         self.observer.add_reaction(rxn)
+#         # Then, call base method
+#         super(ObservedModel, self).add_reaction(rxn)
 
     def add_reactions(self, rxns):
         # Update observer first
