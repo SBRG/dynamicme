@@ -321,6 +321,23 @@ class Optimizer(object):
                         y_klj._metabolites[cons_z_U]=-rxn.upper_bound
                         cons_z_U._reaction.add(y_klj)
 
+        # Only one digit active at a time for each power
+        # Note this only involves the binaries
+        cons_digs = []
+        for group_id, var_cons_coeff in iteritems(var_cons_dict):
+            for l,pwr in enumerate(powers):
+                cons_one_digit = Constraint('cons_digit_%s%s'%(group_id,l))
+                cons_one_digit._constraint_sense = 'L'
+                cons_one_digit._bound = 1.
+                cons_digs.append(cons_one_digit)
+                #mdl.add_metabolites(cons_one_digit)
+
+                for k,digit in enumerate(digits):
+                    yid = 'binary_%s%s%s'%(group_id,k,l)
+                    y_klj = mdl.reactions.get_by_id(yid)
+                    y_klj.add_metabolites({cons_one_digit:1.})
+
+        mdl.add_metabolites(cons_digs)
 
         if prevent_zero:
             # sum_kl y_groupi >= 1
@@ -340,82 +357,7 @@ class Optimizer(object):
         # mdl.add_reactions(new_rxns)
         # mdl.add_metabolites(new_mets)
 
-
-    def add_crowding_radix(self, mdl, crowding_bound, crowding_dict,
-            radix, powers, num_digits_per_power,
-            radix_multiplier=1., crowding_sense='L', M=1e3):
-        """
-        Formulate radix-based discretization of estimated parameters
-        Inputs
-        crowding_dict : dict of {rxn: a0 (nominal parameter value)}
-        """
-        # sum a0j sum_{l=p:P} sum_{k=0:R-1} a0*R^l*k*z_{klj} <= C
-        # -M*(1-y_klj) <= z_klj - xj <= M*(1-y_klj)
-        # xlj*y_klj <= z_klj <= xuj*y_klj
-        pwr_min = min(powers)
-        pwr_max = max(powers)
-        digits  = np.linspace(0, radix-1, num_digits_per_power)
-
-        crowding = Constraint('crowding_radix')
-        crowding._bound = crowding_bound
-        crowding._constraint_sense = crowding_sense
-
-        mdl.add_metabolites(crowding)
-
-        for rxn,a0 in iteritems(crowding_dict):
-            if not isinstance(rxn,Reaction):
-                rxn = mdl.reactions.get_by_id(rxn)
-            rid = rxn.id
-
-            for l,pwr in enumerate(powers):
-                for k,digit in enumerate(digits):
-                    y_klj = Variable('binary_%s%s%s'%(rid,k,l))
-                    y_klj.variable_kind = 'integer'
-                    y_klj.lower_bound = 0.
-                    y_klj.upper_bound = 1.
-                    try:
-                        mdl.add_reaction(y_klj)
-                    except ValueError:
-                        y_klj = mdl.reactions.get_by_id(y_klj.id)
-
-                    z_klj = Variable('z_%s%s%s'%(rid,k,l))
-                    try:
-                        mdl.add_reaction(z_klj)
-                    except ValueError:
-                        z_klj = mdl.reactions.get_by_id(z_klj.id)
-
-                    coeff = radix**pwr * digit * a0
-                    z_klj.add_metabolites({crowding:coeff})
-                    cons_zdiff_L = Constraint('zdiff_L_%s%s%s'%(rid,k,l))
-                    cons_zdiff_L._constraint_sense = 'L'
-                    cons_zdiff_L._bound = M
-                    cons_zdiff_U = Constraint('zdiff_U_%s%s%s'%(rid,k,l))
-                    cons_zdiff_U._constraint_sense = 'L'
-                    cons_zdiff_U._bound = M
-
-                    z_klj.add_metabolites({cons_zdiff_L:-1.})
-                    y_klj.add_metabolites({cons_zdiff_L:M})
-                    rxn.add_metabolites({cons_zdiff_L:1.})
-
-                    z_klj.add_metabolites({cons_zdiff_U:1.})
-                    y_klj.add_metabolites({cons_zdiff_U:M})
-                    rxn.add_metabolites({cons_zdiff_U:-1.})
-
-                    cons_z_L = Constraint('z_L_%s%s%s'%(rid,k,l))
-                    cons_z_L._constraint_sense = 'L'
-                    cons_z_L._bound = 0.
-                    cons_z_U = Constraint('z_U_%s%s%s'%(rid,k,l))
-                    cons_z_U._constraint_sense = 'L'
-                    cons_z_U._bound = 0.
-
-                    z_klj.add_metabolites({cons_z_L:-1.})
-                    y_klj.add_metabolites({cons_z_L:rxn.lower_bound})
-                    z_klj.add_metabolites({cons_z_U:1.})
-                    y_klj.add_metabolites({cons_z_U:-rxn.upper_bound})
-
-        # sum a0j sum_{l=p:P} sum_{k=0:R-1} a0*R^l*k*z_{klj} <= C
-        # -M*(1-y_klj) <= z_klj - xj <= M*(1-y_klj)
-        # xlj*y_klj <= z_klj <= xuj*y_klj
+        return digits
 
 
     def make_disjunctive_primal_dual(self, mdl, a12_dict, M=1e4):

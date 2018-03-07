@@ -40,6 +40,10 @@ def cb_benders(model, where):
 
         if sub.Status == GRB.Status.UNBOUNDED:
             # Add feasibility cut, ensuring that cut indeed eliminates current incumbent
+            if model._verbosity > 1:
+                print('*'*40)
+                print('Adding Feasibility cut')
+
             feascut = decomposer.make_feascut(yopt, zmaster)
             model.cbLazy(feascut)
         else:
@@ -50,7 +54,7 @@ def cb_benders(model, where):
             if model._verbosity > 0:
                 print('#'*40)
                 print('zmaster=%g. zsub=%g. gap=%g' % (zmaster, zsub, gap))
-                print('#'*40)
+                #print('#'*40)
 
             if abs(gap) > GAPTOL:
                 optcut = decomposer.make_optcut()

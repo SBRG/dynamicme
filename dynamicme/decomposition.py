@@ -16,14 +16,18 @@ from scipy.sparse import coo_matrix, csr_matrix, csc_matrix
 from cobra.core import Solution
 from cobra import Reaction, Metabolite, Model
 from cobra import DictList
+from cobra.solvers import gurobi_solver
 from gurobipy import *
 from qminos.quadLP import QMINOS
 
+import gurobipy as grb
 import numpy as np
+import cobra
 import warnings
 
 class Decomposer(object):
-    def __init__(self, milp):
+    def __init__(self, cobra_model, quadratic_component=None, solver='gurobi'):
+        milp = self.to_solver_model(cobra_model, quadratic_component, solver)
         self.milp = milp
         self._INF = 1e3 # Not too big if multiplying with binary var.
         self._master = None
@@ -43,6 +47,66 @@ class Decomposer(object):
         self._xu = None
         self._cx  = None
         self._fy  = None
+
+    def to_solver_model(self, cobra_model, quadratic_component=None, solver='gurobi'):
+        """
+        Create solver-specific model, while keeping track of variable and constraint mapping.
+        Easiest solution: keep the same rxn(var) / met(constraint) names.
+        """
+        from cobra.solvers.gurobi_solver import _float, variable_kind_dict
+        from cobra.solvers.gurobi_solver import parameter_defaults, parameter_mappings
+        from cobra.solvers.gurobi_solver import sense_dict, status_dict, objective_senses, METHODS
+
+
+        if solver != 'gurobi':
+            raise ValueError("Only solver=gurobi supported, currently")
+
+        lp = grb.Model(cobra_model.id)
+        params = parameter_defaults
+        for k,v in iteritems(params):
+            gurobi_solver.set_parameter(lp, k, v)
+
+        # Add and track variables
+        variable_list = [lp.addVar(_float(x.lower_bound),
+                                   _float(x.upper_bound),
+                                   float(x.objective_coefficient),
+                                   variable_kind_dict[x.variable_kind],
+                                   str(x.id))
+                         for i, x in enumerate(cobra_model.reactions)]
+        reaction_to_variable = dict(zip(cobra_model.reactions,
+                                        variable_list))
+        # Integrate new variables
+        lp.update()
+
+        # Add and track constraints
+        for i, the_metabolite in enumerate(cobra_model.metabolites):
+            constraint_coefficients = []
+            constraint_variables = []
+            for the_reaction in the_metabolite._reaction:
+                constraint_coefficients.append(_float(the_reaction._metabolites[the_metabolite]))
+                constraint_variables.append(reaction_to_variable[the_reaction])
+            #Add the metabolite to the problem
+            lp.addConstr(LinExpr(constraint_coefficients, constraint_variables),
+                         sense_dict[the_metabolite._constraint_sense.upper()],
+                         the_metabolite._bound,
+                         str(the_metabolite.id))
+
+        # Set objective to quadratic program
+        if quadratic_component is not None:
+            gurobi_solver.set_quadratic_objective(lp, quadratic_component)
+
+        lp.update()
+
+        return lp
+
+    def convert_solution(self):
+        """
+        Format solution back to cobra from master and subproblem(s).
+        master : master problem
+        submodels : list of submodels
+        cobra_mdl : original cobra model used to create MILP
+        """
+
 
     def benders_decomp(self):
         """
@@ -64,13 +128,16 @@ class Decomposer(object):
         return master, sub
 
     def _split_constraints(self):
-        A,B,d,csenses,xs,ys = split_constraints(self.milp)
+        A,B,d,csenses,xs,ys,C,b,csenses_mp = split_constraints(self.milp)
         self._A = A
         self._Acsc = A.tocsc()
         self._B = B
         self._Bcsc = B.tocsc()
         self._d = d
         self._csenses = csenses
+        self._C = C
+        self._b = b
+        self._csenses_mp = csenses_mp
         self._x0 = xs
         self._y0 = ys
 
@@ -78,7 +145,8 @@ class Decomposer(object):
         """
         min     z
         y,z
-        s.t.    z >= f'y + (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k,  i \in OptimalityCuts
+        s.t.    Cy [<=>] b
+                z >= f'y + (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k,  i \in OptimalityCuts
                 (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k <= 0,        i \in FeasibilityCuts
         """
         LB = -self._INF
@@ -88,11 +156,25 @@ class Decomposer(object):
 
         ys0 = self._y0
         ny = len(ys0)
+        C = self._C
+        b = self._b
+        csenses_mp = self._csenses_mp
+
         B = self._B
         fy = np.array([yj.Obj for yj in ys0])
         master = Model('master')
         z = master.addVar(LB, UB, 0., GRB.CONTINUOUS, 'z')
         ys = [master.addVar(y.LB, y.UB, y.Obj, y.VType, y.VarName) for y in ys0]
+        # Add Cy [<=>] b
+        for i in range(C.shape[0]):
+            csense= csenses_mp[i]
+            bi    = b[i]
+            cinds = C.indices[C.indptr[i]:C.indptr[i+1]]
+            coefs = C.data[C.indptr[i]:C.indptr[i+1]]
+            expr  = LinExpr(coefs, [ys[j] for j in cinds])
+            cons  = master.addConstr(expr, csense, bi, name='MP_%s'%i)
+
+        # Add z >= f'y initially
         rhs = LinExpr(fy, ys)
         master.addConstr(z, GRB.GREATER_EQUAL, rhs)
         master.setObjective(z, GRB.MINIMIZE)
@@ -292,7 +374,9 @@ class Decomposer(object):
 
 
 class DecompModel(object):
-
+    """
+    Class for Benders decomposition
+    """
     def __init__(self, model):
         self.model = model
         qsolver = QMINOS()
@@ -351,28 +435,11 @@ class DecompModel(object):
 
         #if self.A is None:
         # Need to update every time for now
-        A,B,d,csenses0,xs,ys = split_constraints(model)
+        A,B,d,csenses0,xs,ys,C,b,csenses_mp = split_constraints(model)
         xl = np.array([x.LB for x in xs])
         xu = np.array([x.UB for x in xs])
         csenses = [csense_dict[sense] for sense in csenses0]
         cx = np.array([x.OBJ for x in xs])
-        #     self.A = A
-        #     self.B = B
-        #     self.d = d
-        #     self.csenses = csenses
-        #     self.xs = xs
-        #     self.ys = ys
-        #     self.xl = [x.LB for x in xs]
-        #     self.ux = [x.UB for x in xs]
-        #     self.yl = [y.LB for y in ys]
-        #     self.yu = [y.UB for y in ys]
-        # A = self.A
-        # B = self.B
-        # d = self.d
-        # xl = self.xl
-        # xu = self.xu
-        # xs = self.xs
-        # ys = self.ys
         self.cx = cx
         self.xl = xl
         self.xu = xu
@@ -399,17 +466,11 @@ class DecompModel(object):
         # Translate qminos solution to original solver format
 
 
-# class MultiDecomposer(Decomposer):
-#     def make_submodels(self, mdl_ref, df_conds):
-#         """
-#         Generate multiple subproblems
-#         """
-
-
 def split_constraints(model):
     """
     Splits constraints into continuous and integer parts:
-    Ax + By [<=>] d
+    Complicating constraints: Ax + By [<=>] d
+    Integer constraints:      Cy [<=>] b
     """
     constrs = model.getConstrs()
     xs = [x for x in model.getVars() if x.VType == GRB.CONTINUOUS]
@@ -455,5 +516,20 @@ def split_constraints(model):
     ny = len(ys)
     A = coo_matrix((xdata, (xrow_inds, xcol_inds)), shape=(M,nx)).tocsr()
     B = coo_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny)).tocsr()
+    # Find y-only rows
+    boolb = abs(A).sum(axis=1) == 0
+    b_rows = boolb.nonzero()[0]
+    C = B[b_rows,:]
+    d0 = np.array(d)
+    b = d0[b_rows]
+    csenses0 = np.array(csenses)
+    bsenses = csenses0[b_rows]
 
-    return A, B, d, csenses, xs, ys
+    boold = ~boolb
+    d_rows = boold.nonzero()[0]
+    Amix = A[d_rows,:]
+    Bmix = B[d_rows,:]
+    dmix = d0[d_rows]
+    csenses_mix = csenses0[d_rows]
+
+    return Amix, Bmix, dmix, csenses_mix, xs, ys, C, b, bsenses
