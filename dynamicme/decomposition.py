@@ -26,7 +26,8 @@ import cobra
 import warnings
 
 class Decomposer(object):
-    def __init__(self, cobra_model, quadratic_component=None, solver='gurobi'):
+    def __init__(self, cobra_model, objective_sense, quadratic_component=None, solver='gurobi'):
+        self.objective_sense = objective_sense
         milp = self.to_solver_model(cobra_model, quadratic_component, solver)
         self.milp = milp
         self._INF = 1e3 # Not too big if multiplying with binary var.
@@ -196,13 +197,49 @@ class Decomposer(object):
 
         return master
 
+    def make_sub_primal(self, yopt):
+        """
+        Make primal subproblem
+        min(max) c'x
+        s.t.    Ax [<=>] d-B*y
+                l <= x <= u
+        """
+        obj_sense = self.objective_sense
+        xs0 = self._x0
+        A = self._A
+        d = self._d
+        B = self._B
+        csenses = self._csenses
+        m = len(d)
+        n = len(xs0)
+        nx = n
+        xl = np.array([x.LB for x in xs0])
+        xu = np.array([x.UB for x in xs0])
+        cx  = [x.Obj for x in xs0]
+
+        sub = Model('sub_primal')
+        xs  = [sub.addVar(x.LB, x.UB, x.Obj, x.VType, x.VarName) for x in xs0]
+        By  = B*yopt
+        for i in range(m):
+            cinds = A.indices[A.indptr[i]:A.indptr[i+1]]
+            coefs = A.data[A.indptr[i]:A.indptr[i+1]]
+            ax    = LinExpr(coefs, [xs[j] for j in cinds])
+            rhs   = d[i] - By[i]
+            cons  = sub.addConstr(ax, csenses[i], rhs, name=str(i))
+
+        sub.update()
+        sub_wrapper = DecompModel(sub)
+
+        return sub_wrapper
+
     def make_sub(self):
         """
         Constraint doesn't change.
         Objective changes with RMP solution, so yopt is optional when initiating.
+        Allow dual to become unbounded to detect infeasible primal (i.e., no
+        artificial box constraints)
         """
-        LB = -self._INF
-        UB = self._INF
+        INF = GRB.INFINITY
         ZERO = 1e-15
         if self._x0 is None:
             self._split_constraints()
@@ -216,12 +253,13 @@ class Decomposer(object):
         n = len(xs0)
         nx = n
         sub = Model('sub')
-        lb_dict = {GRB.EQUAL: -self._INF, GRB.GREATER_EQUAL: 0., GRB.LESS_EQUAL: -self._INF}
-        ub_dict = {GRB.EQUAL: self._INF, GRB.GREATER_EQUAL: self._INF, GRB.LESS_EQUAL: 0.}
+        sub.Params.InfUnbdInfo = 1 
+        lb_dict = {GRB.EQUAL: -INF, GRB.GREATER_EQUAL: 0., GRB.LESS_EQUAL: -INF}
+        ub_dict = {GRB.EQUAL: INF, GRB.GREATER_EQUAL: INF, GRB.LESS_EQUAL: 0.}
         wa = [sub.addVar(lb_dict[sense], ub_dict[sense], 0., GRB.CONTINUOUS, 'wa[%d]'%i) \
                 for i,sense in enumerate(csenses)]
-        wl = [sub.addVar(0., UB, 0., GRB.CONTINUOUS, 'wl[%d]'%i) for i in range(n)]
-        wu = [sub.addVar(0., UB, 0., GRB.CONTINUOUS, 'wu[%d]'%i) for i in range(n)]
+        wl = [sub.addVar(0., INF, 0., GRB.CONTINUOUS, 'wl[%d]'%i) for i in range(n)]
+        wu = [sub.addVar(0., INF, 0., GRB.CONTINUOUS, 'wu[%d]'%i) for i in range(n)]
         xl = np.array([x.LB for x in xs0])
         xu = np.array([x.UB for x in xs0])
         cx  = [x.Obj for x in xs0]
@@ -330,10 +368,8 @@ class Decomposer(object):
 
     def make_feascut(self):
         """
-        THIS MAY NOT WORK if dvar.X doesn't work for infeas problems.
-        Instead, may need FarkasDuals for primal sub problem
+        Using unbounded ray information (Model.UnbdRay)
         """
-        # Get unbounded ray
         # wa = [w.X for w in self._wa]
         # wl = [w.X for w in self._wl]
         # wu = [w.X for w in self._wu]
@@ -342,16 +378,12 @@ class Decomposer(object):
         wu = np.array([self._sub.x_dict[w.VarName] for w in self._wu])
         ys = self._ys
         d = self._d
-        B = self._B
+        Bcsc = self._Bcsc
         xl = self._xl
         xu = self._xu
-        wa = self._wa
-        wl = self._wl
-        wu = self._wu
         m = len(d)
         n = len(xl)
 
-        Bcsc = self._Bcsc
         waB  = wa*Bcsc
         cinds = waB.nonzero()[0]
         try:
@@ -425,9 +457,16 @@ class DecompModel(object):
         if precision=='gurobi':
             try:
                 model.optimize()
-                self.xopt = np.array([x.X for x in model.getVars()])
-                self.x_dict = {x.VarName:x.X for x in model.getVars()}
-                self.ObjVal = model.ObjVal
+                if model.Status==GRB.OPTIMAL:
+                    self.xopt = np.array([x.X for x in model.getVars()])
+                    self.x_dict = {x.VarName:x.X for x in model.getVars()}
+                    self.ObjVal = model.ObjVal
+                elif model.Status == GRB.UNBOUNDED:
+                    ray = model.UnbdRay
+                    self.xopt   = ray
+                    self.x_dict = {x.VarName:ray[j] for j,x in enumerate(model.getVars())}
+                    self.ObJVal = np.nan #model.ObjVal
+
             except GurobiError as e:
                 print('Caught GurobiError in DecompModel.optimize(): %s'%repr(e))
         else:
