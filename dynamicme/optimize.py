@@ -259,7 +259,10 @@ class Optimizer(object):
 
                         rid = rxn.id
                         cid = cons.id
+                        # z_klj = xj if y_klj=1
                         z_klj = Variable('z_%s_%s%s%s'%(rid,cid,k,l))
+                        z_klj.lower_bound = rxn.lower_bound
+                        z_klj.upper_bound = rxn.upper_bound
                         mdl.add_reaction(z_klj) # slow 3
                         #new_rxns.add(z_klj)
 
