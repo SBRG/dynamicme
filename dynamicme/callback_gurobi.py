@@ -13,6 +13,8 @@ from builtins import range
 
 from gurobipy import *
 
+import numpy as np
+
 
 def cb_benders(model, where):
     GAPTOL = model._gaptol
@@ -30,9 +32,17 @@ def cb_benders(model, where):
         if where==GRB.Callback.MIPSOL:
             yopt = [model.cbGetSolution(y) for y in ys]
             zmaster = model.cbGetSolution(z)
+            if np.nan in yopt:
+                print('MIPSOL: nan in yopt!')
         elif where==GRB.Callback.MIPNODE:
-            yopt = [model.cbGetNodeRel(y) for y in ys]
-            zmaster = model.cbGetNodeRel(z)
+            node_status = model.cbGet(GRB.Callback.MIPNODE_STATUS)
+            if node_status==GRB.OPTIMAL:
+                yopt = [model.cbGetNodeRel(y) for y in ys]
+                zmaster = model.cbGetNodeRel(z)
+            else:
+                if model._verbosity>0:
+                    print('non-optimal cbGet(MIPNODE_STATUS)=%g'%node_status)
+                return
 
         decomposer.update_subobj(yopt)
         sub = decomposer.get_sub()
@@ -40,7 +50,7 @@ def cb_benders(model, where):
 
         if sub.Status == GRB.Status.UNBOUNDED:
             # Add feasibility cut, ensuring that cut indeed eliminates current incumbent
-            if model._verbosity > 1:
+            if model._verbosity > 2:
                 print('*'*40)
                 print('Adding Feasibility cut')
 
@@ -51,7 +61,7 @@ def cb_benders(model, where):
             #gap = zmaster - zsub
             gap = zsub - zmaster    # UB - LB
 
-            if model._verbosity > 0:
+            if model._verbosity > 1:
                 print('#'*40)
                 print('zmaster=%g. zsub=%g. gap=%g' % (zmaster, zsub, gap))
                 #print('#'*40)
@@ -104,7 +114,7 @@ def cb_benders_multi(model, where):
                 #gap = zmaster - zsub
                 gap = zsub - zmaster    # UB - LB
 
-                if model._verbosity > 0:
+                if model._verbosity > 1:
                     print('#'*40)
                     print('zmaster=%g. zsub=%g. gap=%g' % (zmaster, zsub, gap))
                     print('#'*40)

@@ -284,10 +284,13 @@ class Decomposer(object):
 
         dBy = d - B*yopt
         cinds = dBy.nonzero()[0]
-        dBywa = LinExpr([dBy[j] for j in cinds], [wa[j] for j in cinds])
-        obj = dBywa + LinExpr(xl,wl) - LinExpr(xu,wu)
-        sub.setObjective(obj, GRB.MAXIMIZE)
-        sub.update()
+        try:
+            dBywa = LinExpr([dBy[j] for j in cinds], [wa[j] for j in cinds])
+            obj = dBywa + LinExpr(xl,wl) - LinExpr(xu,wu)
+            sub.setObjective(obj, GRB.MAXIMIZE)
+            sub.update()
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in update_subobj(yopt=%s)'%(repr(e),yopt))
 
     def make_optcut(self):
         z = self._z
@@ -317,8 +320,11 @@ class Decomposer(object):
 
         waB  = wa*Bcsc
         cinds = waB.nonzero()[0]
-        waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
-        cut = z >= LinExpr(fy,ys) + sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu)
+        try:
+            waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
+            cut = z >= LinExpr(fy,ys) + sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu)
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in make_optcut()'%repr(e))
 
         return cut
 
@@ -348,8 +354,11 @@ class Decomposer(object):
         Bcsc = self._Bcsc
         waB  = wa*Bcsc
         cinds = waB.nonzero()[0]
-        waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
-        cut = sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu) <= 0
+        try:
+            waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
+            cut = sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu) <= 0
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in make_feascut'%repr(e))
 
         return cut
 
@@ -414,10 +423,13 @@ class DecompModel(object):
     def optimize(self, precision='gurobi'):
         model = self.model
         if precision=='gurobi':
-            model.optimize()
-            self.xopt = np.array([x.X for x in model.getVars()])
-            self.x_dict = {x.VarName:x.X for x in model.getVars()}
-            self.ObjVal = model.ObjVal
+            try:
+                model.optimize()
+                self.xopt = np.array([x.X for x in model.getVars()])
+                self.x_dict = {x.VarName:x.X for x in model.getVars()}
+                self.ObjVal = model.ObjVal
+            except GurobiError as e:
+                print('Caught GurobiError in DecompModel.optimize(): %s'%repr(e))
         else:
             self.qminos_solve(precision)
 
@@ -452,7 +464,7 @@ class DecompModel(object):
 
         basis = self.lp_basis
 
-        xall,stat,hs = qsolver.solvelp(A,b,cx,xl,xu,csenses,precision,basis=basis)
+        xall,stat,hs = qsolver.solvelp(A,b,cx,xl,xu,csenses,precision,basis=basis, verbosity=0)
         nx = len(cx)
         xopt = xall[0:nx]
 
@@ -516,6 +528,9 @@ def split_constraints(model):
     ny = len(ys)
     A = coo_matrix((xdata, (xrow_inds, xcol_inds)), shape=(M,nx)).tocsr()
     B = coo_matrix((ydata, (yrow_inds, ycol_inds)), shape=(M,ny)).tocsr()
+    #********************************************************
+    # DEBUG
+    #********************************************************
     # Find y-only rows
     boolb = abs(A).sum(axis=1) == 0
     b_rows = boolb.nonzero()[0]
@@ -531,5 +546,6 @@ def split_constraints(model):
     Bmix = B[d_rows,:]
     dmix = d0[d_rows]
     csenses_mix = csenses0[d_rows]
+    #********************************************************
 
     return Amix, Bmix, dmix, csenses_mix, xs, ys, C, b, bsenses
