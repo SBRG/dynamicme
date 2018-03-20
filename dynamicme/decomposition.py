@@ -838,13 +838,20 @@ def split_constraints(model):
     return Amix, Bmix, dmix, csenses_mix, xs, ys, C, b, bsenses
 
 
-
-
-class BendersSubmodel(object):
+class BendersMaster(object):
     """
-    Primal (Benders) decomposition submodel.
+    Restricted Master Problem for Primal (Benders) decomposition.
+
+    min     z
+    y,z
+    s.t.    Cy [<=>] b
+            z >= f'y + sum_k tki,                           i \in OptimalityCuts
+            tki >= (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k,  i \in OptimalityCuts
+            (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k <= 0,    i \in FeasibilityCuts
     """
     def __init__(self, cobra_model, solver='gurobi'):
+        self.cobra_model = cobra_model
+        self.sub_dict = {}
         A,B,d,csenses,xs,ys,C,b,csenses_mp = split_cobra(cobra_model)
         self._A = A
         self._Acsc = A.tocsc()
@@ -857,9 +864,144 @@ class BendersSubmodel(object):
         self._csenses_mp = csenses_mp
         self._x0 = xs
         self._y0 = ys
+        self._INF = 1e3
 
-        solver_csenses = [sense_dict[i] for i in csenses]
-        self.init_model(xs, A, d, solver_csenses)
+        self.init_model(ys, C, b, B, csenses_mp)
+
+    def init_model(self, ys0, C, b, B, csenses):
+        LB = -self._INF
+        UB = self._INF
+
+        ys0 = self._y0
+        ny = len(ys0)
+
+        fy = np.array([yj.objective_coefficient for yj in ys0])
+        model = grb.Model('master')
+        z = model.addVar(LB, UB, 0., GRB.CONTINUOUS, 'z')
+        ys = [model.addVar(y.lower_bound, y.upper_bound, y.objective_coefficient,
+            variable_kind_dict[y.variable_kind], y.id) for y in ys0]
+        # Add Cy [<=>] b
+        for i in range(C.shape[0]):
+            csense= sense_dict[csenses[i]]
+            bi    = b[i]
+            cinds = C.indices[C.indptr[i]:C.indptr[i+1]]
+            coefs = C.data[C.indptr[i]:C.indptr[i+1]]
+            expr  = LinExpr(coefs, [ys[j] for j in cinds])
+            cons  = model.addConstr(expr, csense, bi, name='MP_%s'%i)
+
+        # Add z >= f'y initially
+        rhs = LinExpr(fy, ys)
+        model.addConstr(z, GRB.GREATER_EQUAL, rhs)
+        model.setObjective(z, GRB.MINIMIZE)
+
+        self._z = z
+        self._ys = ys
+        self._fy = fy
+
+        model._master = self  # Need this reference to access methods inside callback
+        model._verbosity = 0
+        model._gaptol = 1e-6
+        model._precision_sub = 'gurobi'
+
+        model.Params.Presolve = 0          # To be safe, turn off
+        model.Params.LazyConstraints = 1   # Required to use cbLazy
+        model.Params.IntFeasTol = 1e-9
+
+        model.update()
+        self.model = model
+
+        return model
+
+    def add_submodels(self, sub_dict):
+        """
+        Add submodels.
+        Inputs
+        sub_dict : dict of BendersSubmodel objects
+        """
+        for k,v in iteritems(sub_dict):
+            self.sub_dict[k] = v
+
+    def make_optcut_part(self, sub):
+        """
+        z >= f'y + sum_k tki,                           i \in OptimalityCuts
+        tki >= (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k,  i \in OptimalityCuts
+        """
+        INF = GRB.INFINITY
+        # Can't add variable during callback--malloc
+        #tk = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,'tk')
+
+        z = self._z
+        fy = self._fy
+        ys = self._ys
+        d = sub._d
+        B = sub._B
+        xl = sub._xl
+        xu = sub._xu
+        m = len(d)
+        n = len(xl)
+        ny = len(ys)
+        wa = np.array([sub.model.x_dict[w.VarName] for w in sub._wa])
+        wl = np.array([sub.model.x_dict[w.VarName] for w in sub._wl])
+        wu = np.array([sub.model.x_dict[w.VarName] for w in sub._wu])
+
+        Bcsc = sub._Bcsc
+
+        waB  = wa*Bcsc
+        cinds = waB.nonzero()[0]
+        try:
+            waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
+            cut_part = sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu)
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in make_optcut()'%repr(e))
+
+        return cut_part
+
+    def make_feascut(self, sub):
+        """
+        Using unbounded ray information (Model.UnbdRay)
+        """
+        wa = np.array([sub.model.x_dict[w.VarName] for w in sub._wa])
+        wl = np.array([sub.model.x_dict[w.VarName] for w in sub._wl])
+        wu = np.array([sub.model.x_dict[w.VarName] for w in sub._wu])
+        ys = self._ys
+        d = sub._d
+        Bcsc = sub._Bcsc
+        xl = sub._xl
+        xu = sub._xu
+        m = len(d)
+        n = len(xl)
+
+        waB  = wa*Bcsc
+        cinds = waB.nonzero()[0]
+        try:
+            waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
+            cut = sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu) <= 0
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in make_feascut'%repr(e))
+
+        return cut
+
+
+class BendersSubmodel(object):
+    """
+    Primal (Benders) decomposition submodel.
+    """
+    def __init__(self, cobra_model, solver='gurobi'):
+        self.cobra_model = cobra_model
+        A,B,d,csenses,xs,ys,C,b,csenses_mp = split_cobra(cobra_model)
+        self._A = A
+        self._Acsc = A.tocsc()
+        self._B = B
+        self._Bcsc = B.tocsc()
+        self._d = d
+        self._csenses = csenses
+        self._C = C
+        self._b = b
+        self._csenses_mp = csenses_mp
+        self._x0 = DictList(xs)
+        self._y0 = DictList(ys)
+
+        self.init_model(xs, A, d, csenses)
 
     def init_model(self, xs0, A, d, csenses):
         INF = GRB.INFINITY
@@ -869,6 +1011,8 @@ class BendersSubmodel(object):
         nx = n
         model = grb.Model('sub')
         model.Params.InfUnbdInfo = 1
+        model.Params.OutputFlag = 0
+        csenses = [sense_dict[c] for c in csenses]
         lb_dict = {GRB.EQUAL: -INF, GRB.GREATER_EQUAL: 0., GRB.LESS_EQUAL: -INF}
         ub_dict = {GRB.EQUAL: INF, GRB.GREATER_EQUAL: INF, GRB.LESS_EQUAL: 0.}
         wa = [model.addVar(lb_dict[sense], ub_dict[sense], 0., GRB.CONTINUOUS, 'wa[%d]'%i) \
@@ -907,7 +1051,7 @@ class BendersSubmodel(object):
             dual_cons.append(cons)
 
         model.update()
-        self.model = model
+        self.model = DecompModel(model)
 
     def update_obj(self, yopt):
         model = self.model
@@ -930,10 +1074,3 @@ class BendersSubmodel(object):
             model.update()
         except GurobiError as e:
             print('Caught GurobiError (%s) in update_subobj(yopt=%s)'%(repr(e),yopt))
-
-    def make_optcut(self):
-        pass
-
-    def make_feascut(self):
-        pass
-

@@ -756,3 +756,21 @@ def clone_model(model, observer, suffix=''):
                 met.__dict__[k] = v
 
     return clone
+
+
+#class FullyObservedModel(cobra.core.Model):
+#    def __init__(self, observer, *args, **kwargs):
+#        self.observer = observer
+#        super(ObservedModel, self).__init__(*args, **kwargs)
+#        # Make reactions ObservedDictList
+#        self.reactions = ObservedDictList(observer.reactions, self.reactions)
+#        # # Make metabolites ObservedDictList
+#        self.metabolites = ObservedDictList(observer.metabolites, self.metabolites)
+#
+#    def add_reactions(self, rxns):
+#        self.observer.add_reactions(rxns)
+#        super(ObservedModel, self).add_reactions(rxns)
+#
+#    def add_metabolites(self, mets):
+#        self.observer.add_metabolites(mets)
+#        super(ObservedModel, self).add_metabolites(mets)
