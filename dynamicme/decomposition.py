@@ -848,6 +848,7 @@ class BendersMaster(object):
             z >= f'y + sum_k tki,                           i \in OptimalityCuts
             tki >= (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k,  i \in OptimalityCuts
             (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k <= 0,    i \in FeasibilityCuts
+            tki >= zDk* - u*Hk*y    (cross-decomposition from Lagrangean subproblems)
     """
     def __init__(self, cobra_model, solver='gurobi'):
         self.cobra_model = cobra_model
@@ -1074,3 +1075,37 @@ class BendersSubmodel(object):
             model.update()
         except GurobiError as e:
             print('Caught GurobiError (%s) in update_subobj(yopt=%s)'%(repr(e),yopt))
+
+
+class LagrangeSubmodel(object):
+    """
+    Lagrangean (dual) subproblem
+
+    min  f'yk + c'xk + uk*Hk*yk
+    xk,yk
+    s.t. Axk + Byk [<=>] d
+               Cyk [<=>] b
+         Dxk       [<=>] e
+
+    where uk are Lagrange multipliers updated by Lagrangean master problem,
+    and Hk constrain yk to be the same across all subproblems.
+    """
+    def __init__(self, cobra_model, solver='gurobi'):
+        pass
+
+
+class LagrangeMaster(object):
+    """
+    Lagrangean (dual) master problem:
+
+    max  e + delta/2 ||u - u*||2
+    u,e,sk
+    s.t  e  <= sum_k sk
+         sk <= f'yk + c'xk + u*H*yk,    forall k
+         sk <= zpk* + u*H*y,            forall k
+
+    Cross-decomposition:
+    zpk* is the Benders subproblem objective
+    """
+    def __init__(self):
+        pass
