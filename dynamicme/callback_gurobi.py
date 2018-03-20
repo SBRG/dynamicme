@@ -95,23 +95,19 @@ def cb_benders_multi(model, where):
             yopt = [model.cbGetNodeRel(y) for y in ys]
             zmaster = model.cbGetNodeRel(z)
 
-        decomposer.update_subobj(yopt)
-        subs = decomposer.get_sub()
+        subs = decomposer.get_submodels()
         zsubs = []
 
         for sub in subs:
+            sub.update_obj(yopt)
             sub.optimize(precision=precision_sub)
             if sub.Status == GRB.Status.UNBOUNDED:
                 # Add feasibility cut, ensuring that cut indeed eliminates current incumbent
-                # TODO: Add cut for this subproblem
-                feascut = decomposer.make_feascut(yopt, zmaster)
+                feascut = decomposer.make_feascut(yopt, zmaster, sub)
                 model.cbLazy(feascut)
             else:
-                # TODO: calc objval for this subproblem
-                zsub = decomposer.calc_sub_objval(yopt)
+                zsub = decomposer.calc_sub_objval(yopt, sub)
                 zsubs.append(zsub)
-
-                #gap = zmaster - zsub
                 gap = zsub - zmaster    # UB - LB
 
                 if model._verbosity > 1:
@@ -120,7 +116,7 @@ def cb_benders_multi(model, where):
                     print('#'*40)
 
                 if abs(gap) > GAPTOL:
-                    optcut = decomposer.make_optcut()
+                    optcut = decomposer.make_optcut(sub)
                     model.cbLazy(optcut)
 
                 else:

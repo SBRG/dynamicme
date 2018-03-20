@@ -13,6 +13,7 @@
 from six import iteritems
 from cobra.core.Solution import Solution
 from cobra import Reaction, Metabolite, Model
+from cobra import DictList
 
 import numpy as np
 import cobra
@@ -242,6 +243,9 @@ class Optimizer(object):
                     yid = 'binary_%s%s%s'%(group_id,k,l)
                     if mdl.reactions.has_id(yid):
                         y_klj = mdl.reactions.get_by_id(yid)
+                    elif hasattr(mdl, 'observer') and mdl.observer.reactions.has_id(yid):
+                        ### TODO: make this observer checking more inherent?
+                        y_klj = mdl.observer.reactions.get_by_id(yid)
                     else:
                         y_klj = Variable(yid)
                         y_klj.variable_kind = 'integer'
@@ -337,8 +341,15 @@ class Optimizer(object):
 
                 for k,digit in enumerate(digits):
                     yid = 'binary_%s%s%s'%(group_id,k,l)
-                    y_klj = mdl.reactions.get_by_id(yid)
-                    y_klj.add_metabolites({cons_one_digit:1.})
+                    if mdl.reactions.has_id(yid):
+                        y_klj = mdl.reactions.get_by_id(yid)
+                    elif hasattr(mdl, 'observer') and mdl.observer.reactions.has_id(yid):
+                        ### TODO: make this observer checking more inherent?
+                        y_klj = mdl.observer.reactions.get_by_id(yid)
+                    else:
+                        raise KeyError('%s not in model or observer'%yid)
+
+                    y_klj.add_metabolites({cons_one_digit:1.}, combine=False)
 
         mdl.add_metabolites(cons_digs)
 
@@ -353,7 +364,14 @@ class Optimizer(object):
                 for l,pwr in enumerate(powers):
                     for k,digit in enumerate(digits):
                         yid = 'binary_%s%s%s'%(group_id,k,l)
-                        y_klj = mdl.reactions.get_by_id(yid)
+                        if mdl.reactions.has_id(yid):
+                            y_klj = mdl.reactions.get_by_id(yid)
+                        elif hasattr(mdl, 'observer') and mdl.observer.reactions.has_id(yid):
+                            ### TODO: make this observer checking more inherent?
+                            y_klj = mdl.observer.reactions.get_by_id(yid)
+                        else:
+                            raise KeyError('%s not in model or observer'%yid)
+
                         y_klj._metabolites[cons] = 1.
                         cons._reaction.add(y_klj)
 
@@ -617,28 +635,36 @@ class Optimizer(object):
         return mdl
 
 
+class ObservedDictList(DictList):
+    def __init__(self, observer, *args, **kwargs):
+        self.observer = observer
+        super(ObservedDictList, self).__init__(*args, **kwargs)
+
+    def has_id(self, _id):
+        return _id in self.observer or super(ObservedDictList, self).has_id(_id)
+
+    def get_by_id(self, _id):
+        try:
+            return super(ObservedDictList, self).get_by_id(_id)
+        except KeyError:
+            return self.observer.get_by_id(_id)
+
+
 class ObservedModel(cobra.core.Model):
     def __init__(self, observer, *args, **kwargs):
         self.observer = observer
         super(ObservedModel, self).__init__(*args, **kwargs)
-
-#   Calls add_reactions, so no need
-#     def add_reaction(self, rxn):
-#         # Update observer first
-#         self.observer.add_reaction(rxn)
-#         # Then, call base method
-#         super(ObservedModel, self).add_reaction(rxn)
+        # Make reactions ObservedDictList
+        # self.reactions = ObservedDictList(observer.reactions, self.reactions)
+        # # Make metabolites ObservedDictList
+        # self.metabolites = ObservedDictList(observer.metabolites, self.metabolites)
 
     def add_reactions(self, rxns):
-        # Update observer first
         self.observer.add_reactions(rxns)
-        # Then, call base method
         super(ObservedModel, self).add_reactions(rxns)
 
     def add_metabolites(self, mets):
-        # Update observer first
         self.observer.add_metabolites(mets)
-        # Then, call base method
         super(ObservedModel, self).add_metabolites(mets)
 
 
