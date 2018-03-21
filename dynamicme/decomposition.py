@@ -10,6 +10,7 @@
 # 21 Feb 2018:  first version
 #============================================================
 
+from __future__ import division
 from six import iteritems
 from builtins import range
 from scipy.sparse import coo_matrix, csr_matrix, csc_matrix
@@ -867,7 +868,7 @@ class BendersMaster(object):
         self._y0 = ys
         self._INF = 1e3
 
-        self.init_model(ys, C, b, B, csenses_mp)
+        self.model = self.init_model(ys, C, b, B, csenses_mp)
 
     def init_model(self, ys0, C, b, B, csenses):
         LB = -self._INF
@@ -890,10 +891,9 @@ class BendersMaster(object):
             expr  = LinExpr(coefs, [ys[j] for j in cinds])
             cons  = model.addConstr(expr, csense, bi, name='MP_%s'%i)
 
-        # Add z >= f'y initially
+        # Add z >= f'y + sum_k tk initially
         rhs = LinExpr(fy, ys)
-        model.addConstr(z, GRB.GREATER_EQUAL, rhs)
-        model.setObjective(z, GRB.MINIMIZE)
+        model.addConstr(z, GRB.GREATER_EQUAL, rhs, 'z_cut')
 
         self._z = z
         self._ys = ys
@@ -913,18 +913,34 @@ class BendersMaster(object):
 
         return model
 
-    def add_submodels(self, sub_dict):
+    def add_submodels(self, sub_dict, weight_dict=None):
         """
         Add submodels.
         Inputs
         sub_dict : dict of BendersSubmodel objects
         """
+        INF = self._INF
+
+        zcut = self.model.getConstrByName('z_cut')
         for k,v in iteritems(sub_dict):
             self.sub_dict[k] = v
+            # Also update/add tk variable and constraints
+            tk_id = 'tk_%s'%k
+            tk = self.model.getVarByName(tk_id)
+            if tk is None:
+                tk = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,tk_id)
+            # Update z cut: z >= f'y + sum_k wk*tk
+            # z - f'y - sum_k wk*tk >= 0
+            wk = v._weight
+            self.model.chgCoeff(zcut, tk, -wk)
 
-    def make_optcut_part(self, sub):
+        self.model.update()
+
+
+    def make_optcut(self, sub):
         """
         z >= f'y + sum_k tki,                           i \in OptimalityCuts
+        (Above remains the same. Just append to tk)
         tki >= (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k,  i \in OptimalityCuts
         """
         INF = GRB.INFINITY
@@ -946,16 +962,16 @@ class BendersMaster(object):
         wu = np.array([sub.model.x_dict[w.VarName] for w in sub._wu])
 
         Bcsc = sub._Bcsc
-
         waB  = wa*Bcsc
         cinds = waB.nonzero()[0]
+        tk = self.model.getVarByName('tk_%s'%sub._id)
         try:
             waBy = LinExpr([waB[j] for j in cinds], [ys[j] for j in cinds])
-            cut_part = sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu)
+            optcut = tk >= sum(d*wa) - waBy + sum(xl*wl) - sum(xu*wu)
         except GurobiError as e:
             print('Caught GurobiError (%s) in make_optcut()'%repr(e))
 
-        return cut_part
+        return optcut
 
     def make_feascut(self, sub):
         """
@@ -987,8 +1003,10 @@ class BendersSubmodel(object):
     """
     Primal (Benders) decomposition submodel.
     """
-    def __init__(self, cobra_model, solver='gurobi'):
+    def __init__(self, cobra_model, _id, solver='gurobi', weight=1.):
+        self._id = _id
         self.cobra_model = cobra_model
+        self._weight = weight
         A,B,d,csenses,xs,ys,C,b,csenses_mp = split_cobra(cobra_model)
         self._A = A
         self._Acsc = A.tocsc()
@@ -1002,7 +1020,7 @@ class BendersSubmodel(object):
         self._x0 = DictList(xs)
         self._y0 = DictList(ys)
 
-        self.init_model(xs, A, d, csenses)
+        self.model = self.init_model(xs, A, d, csenses)
 
     def init_model(self, xs0, A, d, csenses):
         INF = GRB.INFINITY
@@ -1054,6 +1072,8 @@ class BendersSubmodel(object):
         model.update()
         self.model = DecompModel(model)
 
+        return model
+
     def update_obj(self, yopt):
         model = self.model
         d = self._d
@@ -1081,7 +1101,7 @@ class LagrangeSubmodel(object):
     """
     Lagrangean (dual) subproblem
 
-    min  f'yk + c'xk + uk*Hk*yk
+    min  f'yk + c'xk + uk'*Hk*yk
     xk,yk
     s.t. Axk + Byk [<=>] d
                Cyk [<=>] b
@@ -1090,22 +1110,274 @@ class LagrangeSubmodel(object):
     where uk are Lagrange multipliers updated by Lagrangean master problem,
     and Hk constrain yk to be the same across all subproblems.
     """
-    def __init__(self, cobra_model, solver='gurobi'):
-        pass
+    def __init__(self, cobra_model, _id, solver='gurobi', weight=1.):
+        self._id = _id
+        self.cobra_model = cobra_model
+        self._weight = weight
+        A,B,d,dsenses,xs,ys,C,b,bsenses = split_cobra(cobra_model)
+        self._A = A
+        self._Acsc = A.tocsc()
+        self._B = B
+        self._Bcsc = B.tocsc()
+        self._d = d
+        self._dsenses = dsenses
+        self._C = C
+        self._b = b
+        self._bsenses = bsenses
+        self._x0 = DictList(xs)
+        self._y0 = DictList(ys)
+        self._H = None
+
+        # self.model = self.init_model(xs, A, d, csenses)
+        self.model = self.init_model()
+
+    def init_model(self):
+        model = grb.Model('sub')
+        model.Params.OutputFlag = 0
+        # These constraints don't change
+        A = self._A
+        Acsc = self._Acsc
+        B = self._B
+        Bcsc = self._Bcsc
+        d = self._d
+        dsenses = self._dsenses
+        C = self._C
+        b = self._b
+        bsenses = self._bsenses
+        xs0 = self._x0
+        ys0 = self._y0
+
+        fy = np.array([yj.objective_coefficient for yj in ys0])
+        ys = [model.addVar(y.lower_bound, y.upper_bound, y.objective_coefficient,
+            variable_kind_dict[y.variable_kind], y.id) for y in ys0]
+        cx = np.array([xj.objective_coefficient for xj in xs0])
+        xs = [model.addVar(x.lower_bound, x.upper_bound, x.objective_coefficient,
+            variable_kind_dict[x.variable_kind], x.id) for x in xs0]
+
+        self._xs = xs
+        self._ys = ys
+        self._fy = fy
+        self._cx = cx
+
+        # Add Cy [<=>] b
+        for i in range(C.shape[0]):
+            bsense= bsenses[i]
+            bi    = b[i]
+            cinds = C.indices[C.indptr[i]:C.indptr[i+1]]
+            coefs = C.data[C.indptr[i]:C.indptr[i+1]]
+            expr  = LinExpr(coefs, [ys[j] for j in cinds])
+            cons  = model.addConstr(expr, bsense, bi, name='Cy_%s'%i)
+        # Add Axk + Byk [<=>] dk
+        for i in range(A.shape[0]):
+            # A*x
+            cinds = A.indices[A.indptr[i]:A.indptr[i+1]]
+            coefs = A.data[A.indptr[i]:A.indptr[i+1]]
+            exprA = LinExpr(coefs, [xs[j] for j in cinds])
+            # B*y
+            cinds = B.indices[B.indptr[i]:B.indptr[i+1]]
+            coefs = B.data[B.indptr[i]:B.indptr[i+1]]
+            exprB = LinExpr(coefs, [ys[j] for j in cinds])
+            # Ax + By [<=>] d
+            di    = d[i]
+            dsense= dsenses[i]
+            cons = model.addConstr(exprA+exprB, dsense, di, name="AxBy_%s"%i)
+
+        model.update()
+
+        model.Params.IntFeasTol = 1e-9
+
+        return model
+
+    def update_obj(self, uk):
+        """
+        min  f'yk + c'xk + uk'*Hk*yk
+        """
+        ys = self._ys
+        xs = self._xs
+        fy = self._fy
+        cx = self._cx
+        Hk = self._H
+        uH = uk*Hk
+
+        model = self.model
+
+        obj_fun = LinExpr(fy,ys) + LinExpr(cx,xs) + LinExpr(uH,ys)
+        model.setObjective(obj_fun, GRB.MINIMIZE)
+        model.update()
+
+    def optimize(self, xk, yk):
+        """
+        Solve with warm-start
+        """
+        model = self.model
+        xs = self._xs
+        ys = self._ys
+
+        for x,xopt in zip(xs,xk):
+            x.Start = xopt
+
+        for y,yopt in zip(ys,yk):
+            y.Start = yopt
+
+        model.optimize()
 
 
 class LagrangeMaster(object):
     """
     Lagrangean (dual) master problem:
 
-    max  e + delta/2 ||u - u*||2
-    u,e,sk
-    s.t  e  <= sum_k sk
-         sk <= f'yk + c'xk + u*H*yk,    forall k
-         sk <= zpk* + u*H*y,            forall k
+    max  z + delta/2 ||u - u*||2
+    u,z,tk
+    s.t  z  <= sum_k wk*tk
+         tk <= f'yk + c'xk + u*Hk*yk,    forall k
+         tk <= zpk* + u*H*y,            forall k
 
     Cross-decomposition:
     zpk* is the Benders subproblem objective
     """
-    def __init__(self):
-        pass
+    def __init__(self, cobra_model, solver='gurobi'):
+        self.cobra_model = cobra_model
+        self.sub_dict = {}
+        A,B,d,csenses,xs,ys,C,b,csenses_mp = split_cobra(cobra_model)
+        self._A = A
+        self._Acsc = A.tocsc()
+        self._B = B
+        self._Bcsc = B.tocsc()
+        self._d = d
+        self._csenses = csenses
+        self._C = C
+        self._b = b
+        self._csenses_mp = csenses_mp
+        self._x0 = xs
+        self._y0 = ys
+        self._INF = 1e3
+
+        self.model = self.init_model(ys)
+
+    def init_model(self, ys0):
+        INF = self._INF
+
+        model = grb.Model('master')
+        z = model.addVar(-INF,INF,0.,GRB.CONTINUOUS,'z')
+        self._z = z
+        # Lagrange multiplier for each constraint making y same across conditions
+        # z  <= sum_k wk*sk
+        model.addConstr(z, GRB.LESS_EQUAL, 0., 'z_cut')
+        self.model = model
+        model.update()
+
+        return model
+
+    def update_obj(self, delta=1, u0=None):
+        """
+        #----------------------------------------------------
+        # max  z - delta/2 ||u - u0||2
+        #----------------------------------------------------
+        """
+        model = self.model
+        z = self._z
+        us = self._us
+        if u0 is None:
+            u0 = np.zeros(len(us))
+        # Quadratic part: delta/2 * u^2
+        unorm_quad = grb.QuadExpr()
+        for u in us:
+            unorm_quad.addTerms(delta/2., u, u)
+        # Linear part(s): -delta * u0*u
+        unorm_lin = LinExpr(-delta*u0, us)
+        # Constant part: u0^2
+        unorm_const = delta/2.*sum(u0*u0)
+        obj_fun = z - unorm_lin - unorm_quad - unorm_const
+        model.setObjective(obj_fun, GRB.MAXIMIZE)
+        model.update()
+
+        return obj_fun
+
+    def add_submodels(self, sub_dict):
+        """
+        Add submodels.
+        Inputs
+        sub_dict : dict of LagrangeSubmodel objects
+        """
+        INF = self._INF
+        zcut = self.model.getConstrByName('z_cut')
+        for sub_ind,sub in iteritems(sub_dict):
+            self.sub_dict[sub_ind] = sub
+            # Also update tk variables and constraints
+            tk_id = 'tk_%s'%sub_ind
+            tk = self.model.getVarByName(tk_id)
+            if tk is None:
+                tk = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,tk_id)
+            # Update cut
+            # z <= sum_k wk*tk
+            # z - sum_k wk*tk <= 0
+            wk = sub._weight
+            self.model.chgCoeff(zcut, tk, -wk)
+
+        # Update non-anticipativity constraints using ALL submodels
+        nsub = len(self.sub_dict.keys())
+        ny = len(self._y0)
+        # Update us
+        INF = self._INF
+        us = []
+        for j in range(ny):
+            for k in range(nsub-1):
+                vid = 'u_%d%d'%(j,k)
+                ujk = self.model.getVarByName(vid)
+                if ujk is None:
+                    # Multiplier for an equality constraint
+                    ujk = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,vid)
+                us.append(ujk)
+
+        self._us = us
+
+        # Each submodel's Hk: [ny*(K-1) x ny] matrix
+        Hm = ny*(nsub-1)
+        Hn = ny
+        for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+            if k < nsub-1:
+                # Last set doesn't need self
+                data_self = np.ones(ny).tolist()
+                rows_self = np.arange(k*ny,(k+1)*ny).tolist() #range(ny) + k*ny
+                cols_self = list(range(ny))
+            else:
+                data_self = []
+                rows_self = []
+                cols_self = []
+            if k > 0:
+                data_other= (-np.ones(ny)).tolist()
+                rows_other= np.arange((k-1)*ny,k*ny).tolist() #range(ny) + (k-1)*ny
+                cols_other= list(range(ny))
+            else:
+                data_other= []
+                rows_other= []
+                cols_other= []
+
+            data = data_self + data_other
+            rows = rows_self + rows_other
+            cols = cols_self + cols_other
+
+            Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
+            sub._H = Hk
+
+        self.update_obj()
+
+        self.model.update()
+
+    def make_optcut(self, sub, xk, yk):
+        """
+        tk <= f'yk + c'xk + u*Hk*yk,    forall k
+        Hk = [ny*(K-1) x ny] matrix
+        """
+        tk  = self.model.getVarByName('tk_%s'%sub._id)
+        fy  = sub._fy
+        cx  = sub._cx
+        Hk  = sub._H
+        yH  = Hk*yk
+        us  = self._us
+        try:
+            optcut = tk <= sum(fy*yk) + sum(cx*xk) + LinExpr(yH,us)
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in make_optcut()'%repr(e))
+
+        return optcut

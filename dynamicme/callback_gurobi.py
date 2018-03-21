@@ -129,7 +129,7 @@ def cb_benders_multi(model, where):
                 feascut = master.make_feascut(sub)
                 model.cbLazy(feascut)
             else:
-                zsub_total += sub.model.ObjVal
+                zsub_total += sub._weight*sub.model.ObjVal
                 opt_sub_inds.append(sub_ind)
 
         gap = zsub_total - zmaster
@@ -139,16 +139,13 @@ def cb_benders_multi(model, where):
             print('zmaster=%g. zsub=%g. gap=%g' % (zmaster, zsub_total, gap))
 
         if abs(gap) > GAPTOL:
-            cutparts = []
-            for sub_ind in opt_sub_inds:
-                sub = sub_dict[sub_ind]
-                optcut_part = master.make_optcut_part(sub)
-                cutparts.append(optcut_part)
-            multisum_cut = z >= LinExpr(fy,ys) + quicksum(cutparts)
             if model._verbosity > 1:
                 #print('*'*40)
                 print('Adding optimality multi-cut')
-            model.cbLazy(multisum_cut)
+            for sub_ind in opt_sub_inds:
+                sub = sub_dict[sub_ind]
+                optcut = master.make_optcut(sub)
+                model.cbLazy(optcut)
         else:
             # Accept as new incumbent
             pass
