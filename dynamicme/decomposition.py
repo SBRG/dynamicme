@@ -895,6 +895,9 @@ class BendersMaster(object):
         rhs = LinExpr(fy, ys)
         model.addConstr(z, GRB.GREATER_EQUAL, rhs, 'z_cut')
 
+        # Set objective: min z
+        model.setObjective(z, GRB.MINIMIZE)
+
         self._z = z
         self._ys = ys
         self._fy = fy
@@ -1070,7 +1073,7 @@ class BendersSubmodel(object):
             dual_cons.append(cons)
 
         model.update()
-        self.model = DecompModel(model)
+        model = DecompModel(model)
 
         return model
 
@@ -1381,3 +1384,18 @@ class LagrangeMaster(object):
             print('Caught GurobiError (%s) in make_optcut()'%repr(e))
 
         return optcut
+
+    def make_benderscut(self, sub, zpk, yopt):
+        """
+        tk <= zpk* + u*H*y,            forall k
+        """
+        tk  = self.model.getVarByName('tk_%s'%sub._id)
+        Hk  = sub._H
+        yH  = Hk*yopt
+        us  = self._us
+        try:
+            cut = tk <= zpk + LinExpr(yH,us)
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in make_benderscut()'%repr(e))
+
+        return cut

@@ -166,7 +166,7 @@ class RadixEstimator(Estimator):
                 radix,powers,digits=digits,prevent_zero=prevent_zero)
 
         if max_nonzero_binaries is not None:
-            limit_nonzero_binaries(max_nonzero_binaries)
+            self.limit_nonzero_binaries(stacker.model, max_nonzero_binaries)
 
         #----------------------------------------------------
         # Update self
@@ -257,24 +257,23 @@ class RadixEstimator(Estimator):
         else:
             raise Exception("Objective=%s not supported!"%(objective))
 
-    def limit_nonzero_binaries(self, max_nonzero):
+    def limit_nonzero_binaries(self, model, max_nonzero):
         """
         Add constraint to limit number of nonzero binaries
         """
-        stacker = self.stacker
         var_cons_dict = self.var_cons_dict
         cid = 'limit_binaries'
-        if stacker.model.metabolites.has_id(cid):
-            cons = stacker.model.metabolites.get_by_id(cid)
+        if model.metabolites.has_id(cid):
+            cons = model.metabolites.get_by_id(cid)
         else:
             cons = Constraint(cid)
-        stacker.model.add_metabolites(cons)
+        model.add_metabolites(cons)
         # sum y <= maxy
         miny = len(var_cons_dict)
-        maxy = max(miny,maxy)
+        maxy = max(miny,max_nonzero)
         cons._bound = maxy
         cons._constraint_sense = 'L'
-        for rxn in stacker.model.reactions.query('binary_'):
+        for rxn in model.reactions.query('binary_'):
             rxn.add_metabolites({cons:1.})
 
     def get_params(self):
