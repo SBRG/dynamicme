@@ -132,11 +132,12 @@ def cb_benders_multi(model, where):
                     'Best UB=%g. Best LB=%g (MIP_OBJBND=%g). Gap=%g. Relgap=%g%%. nFeasCut=%d. nOptCut=%d'%(
                     UB,LB,OBJBND,gap,relgap*100,nfeas,nopt))
 
-    #elif where in (GRB.Callback.MIPSOL, GRB.Callback.MIPNODE):
-    elif where == GRB.Callback.MIPSOL:
+    elif where in (GRB.Callback.MIPSOL, GRB.Callback.MIPNODE):
+    #elif where == GRB.Callback.MIPSOL:
         ### Lazy constraints only allowed for MIPNODE or MIPSOL
         #****************************************************
-        # Only add Benders cut to exclude new incumbent.
+        # Only add Benders cut to exclude new incumbent?
+        # Doesn't improve lower bound then, which is problematic.
         #****************************************************
         # In general, use lazy constraint to exclude incumebt (MIPSOL)
         # or to fathom node (MIPNODE) by rendering it infeasible with cut.
@@ -174,16 +175,16 @@ def cb_benders_multi(model, where):
                 # If even one submodel infeasible, original problem infeasible.
                 feascut = master.make_feascut(sub)
                 master.feascuts.add(feascut)
-                model.cbLazy(feascut)
+                #model.cbLazy(feascut)
             else:
                 sub_obj = sub._weight*sub.model.ObjVal
                 sub_objs.append(sub_obj)
                 opt_sub_inds.append(sub_ind)
 
         ### Add back all feascut, including previous ones that may have been dropped
-        # for cut in master.feascuts:
-        #     ### TODO: only add violated cuts
-        #     model.cbLazy(cut)
+        for cut in master.feascuts:
+            ### TODO: only add violated cuts
+            model.cbLazy(cut)
 
         #----------------------------------------------------
         # Get LB and UB for this node
@@ -212,12 +213,12 @@ def cb_benders_multi(model, where):
                 sub = sub_dict[sub_ind]
                 optcut = master.make_optcut(sub)
                 master.optcuts.add(optcut)
-                model.cbLazy(optcut)
+                #model.cbLazy(optcut)
 
-            ### Add back all the optcuts
-            # for cut in master.optcuts:
-            #     ### TODO: only add violated
-            #     model.cbLazy(cut)
+            ## Add back all the optcuts
+            for cut in master.optcuts:
+                ### TODO: only add violated
+                model.cbLazy(cut)
         else:
             # Accept as new incumbent (MIPSOL) or keep exploring node (MIPNODE)
             pass
