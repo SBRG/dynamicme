@@ -681,7 +681,7 @@ class StackOptimizer(object):
             pass
 
 
-    def stack_models(self, mdl_ref, df_conds):
+    def stack_models(self, mdl_ref, df_conds, col_ind='cond'):
         """
         Stack models according to data frame
         Also keep some reference to each condition-specific model
@@ -692,10 +692,10 @@ class StackOptimizer(object):
             cond rxn lb ub obj
         """
         stacked_model = Model('stacked')
-        conds = df_conds.cond.unique()
+        conds = df_conds[col_ind].unique()
 
         for cind,cond in enumerate(conds):
-            dfi = df_conds[ df_conds.cond==cond]
+            dfi = df_conds[ df_conds[col_ind]==cond]
             # Create clone of reference model
             suffix = '_%s'%cond
             mdli = clone_model(mdl_ref, stacked_model, suffix=suffix)
