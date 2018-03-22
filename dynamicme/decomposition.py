@@ -190,7 +190,7 @@ class Decomposer(object):
 
         master._decomposer = self   # Need this reference to access methods inside callback
         master._verbosity = 0
-        master._gaptol = 1e-6
+        master._gaptol = 1e-4   # relative gaptol
         master._precision_sub = 'double'
 
         master.Params.Presolve = 0          # To be safe, turn off
@@ -867,6 +867,14 @@ class BendersMaster(object):
         self._x0 = xs
         self._y0 = ys
         self._INF = 1e3
+        self.optcuts = set()      # Need to keep all cuts in case they are dropped at a node
+        self.feascuts = set()
+        self.UB = 1e15
+        self.LB = -1e15
+        self.verbosity = 0
+        self.gaptol = 1e-4    # relative gap tolerance
+        self.precision_sub = 'gurobi'
+        self.print_iter = 20
 
         self.model = self.init_model(ys, C, b, B, csenses_mp)
 
@@ -903,9 +911,6 @@ class BendersMaster(object):
         self._fy = fy
 
         model._master = self  # Need this reference to access methods inside callback
-        model._verbosity = 0
-        model._gaptol = 1e-6
-        model._precision_sub = 'gurobi'
 
         model.Params.Presolve = 0          # To be safe, turn off
         model.Params.LazyConstraints = 1   # Required to use cbLazy
