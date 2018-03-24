@@ -14,6 +14,7 @@ from six import iteritems
 from cobra.core.Solution import Solution
 from cobra import Reaction, Metabolite, Model
 from cobra import DictList
+from generate import copy_model
 
 import numpy as np
 import cobra
@@ -710,6 +711,57 @@ class StackOptimizer(object):
 
         self.model = stacked_model
 
+
+class SplitOptimizer(object):
+    """
+    Split data across submodels.
+    """
+    def __init__(self, *args, **kwargs):
+        self.model_dict = {}
+        super(SplitOptimizer, self).__init__(*args, **kwargs)
+
+    def yield_models(self, mdl_ref, df_X, col_ind='cond'):
+        """
+        Generate models but store mapping from condition to model.
+        """
+        conds = df_X[col_ind].unique()
+        for cind,cond in enumerate(conds):
+            dfi = df_X[df_X[col_ind]==cond]
+            suffix = '_%s'%cond
+            mdli = copy_model(mdl_ref, suffix=suffix)
+            for i,row in dfi.iterrows():
+                rxn = mdli.reactions.get_by_id(row['rxn']+suffix)
+                rxn.lower_bound = row['lb']
+                rxn.upper_bound = row['ub']
+                rxn.objective_coefficient = row['obj']
+
+            yield (cond, mdli)
+
+
+    def store_models(self, mdl_ref, df_conds, col_ind='cond'):
+        """
+        Store models instead of generating on the fly
+        Also keep some reference to each condition-specific model.
+
+        Inputs:
+        mdl_ref : reference model
+        df_conds : dataframe of conditions with columns:
+            cond rxn lb ub obj
+        """
+        conds = df_X[col_ind].unique()
+        for cind,cond in enumerate(conds):
+            dfi = df_X[df_X[col_ind]==cond]
+            suffix = '_%s'%cond
+            mdli = copy_model(mdl_ref, suffix=suffix)
+            for i,row in dfi.iterrows():
+                rxn = mdli.reactions.get_by_id(row['rxn']+suffix)
+                rxn.lower_bound = row['lb']
+                rxn.upper_bound = row['ub']
+                rxn.objective_coefficient = row['obj']
+
+            self.model_dict[cond] = mdli
+
+
 def clone_attributes(orig, clone):
     unique_rxn_attrs = ['_model','id','_metabolites','_genes']
     unique_met_attrs = ['_model','id','_reaction']
@@ -756,21 +808,3 @@ def clone_model(model, observer, suffix=''):
                 met.__dict__[k] = v
 
     return clone
-
-
-#class FullyObservedModel(cobra.core.Model):
-#    def __init__(self, observer, *args, **kwargs):
-#        self.observer = observer
-#        super(ObservedModel, self).__init__(*args, **kwargs)
-#        # Make reactions ObservedDictList
-#        self.reactions = ObservedDictList(observer.reactions, self.reactions)
-#        # # Make metabolites ObservedDictList
-#        self.metabolites = ObservedDictList(observer.metabolites, self.metabolites)
-#
-#    def add_reactions(self, rxns):
-#        self.observer.add_reactions(rxns)
-#        super(ObservedModel, self).add_reactions(rxns)
-#
-#    def add_metabolites(self, mets):
-#        self.observer.add_metabolites(mets)
-#        super(ObservedModel, self).add_metabolites(mets)

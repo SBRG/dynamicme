@@ -912,7 +912,7 @@ class BendersMaster(object):
 
         model._master = self  # Need this reference to access methods inside callback
 
-        model.Params.Presolve = 0          # To be safe, turn off
+        # model.Params.Presolve = 0          # To be safe, turn off
         model.Params.LazyConstraints = 1   # Required to use cbLazy
         model.Params.IntFeasTol = 1e-9
 

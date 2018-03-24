@@ -81,10 +81,13 @@ def cb_benders_multi(model, where):
     --------------------------------------------------------
     Callback function for multicut Benders.
 
+    ********************************************************
     From Gurobi documentation:
     "Your callback should be prepared to cut off solutions that violate any of your
-    lazy constraints, including those that have already been added.
-    Node solutions will usually respect previously added lazy constraints, but not always."
+    lazy constraints,
+    >>> including those that have already been added.
+    >>> Node solutions will usually respect previously added lazy constraints, but not always."
+    ********************************************************
 
     --------------------------------------------------------
     Definitions
@@ -175,16 +178,17 @@ def cb_benders_multi(model, where):
                 # If even one submodel infeasible, original problem infeasible.
                 feascut = master.make_feascut(sub)
                 master.feascuts.add(feascut)
-                #model.cbLazy(feascut)
+                model.cbLazy(feascut)   # Add to lazy constraint pool 
             else:
                 sub_obj = sub._weight*sub.model.ObjVal
                 sub_objs.append(sub_obj)
                 opt_sub_inds.append(sub_ind)
 
-        ### Add back all feascut, including previous ones that may have been dropped
-        for cut in master.feascuts:
-            ### TODO: only add violated cuts
-            model.cbLazy(cut)
+        # "Node solutions will usually respect previously added lazy constraints, but not always."
+        # Add back all feascut, including previous ones that may have been dropped
+        # for cut in master.feascuts:
+        #     ### TODO: only add violated cuts
+        #     model.cbLazy(cut)
 
         #----------------------------------------------------
         # Get LB and UB for this node
@@ -213,11 +217,15 @@ def cb_benders_multi(model, where):
                 sub = sub_dict[sub_ind]
                 optcut = master.make_optcut(sub)
                 master.optcuts.add(optcut)
-                #model.cbLazy(optcut)
+                model.cbLazy(optcut)    # Add to lazy constraint pool
 
-            ## Add back all the optcuts
+            # "Node solutions will usually respect previously added lazy constraints,
+            # but not always."
+            # Add back all the optcuts
             for cut in master.optcuts:
                 ### TODO: only add violated
+                # Violated?
+                # If so, add again to pool
                 model.cbLazy(cut)
         else:
             # Accept as new incumbent (MIPSOL) or keep exploring node (MIPNODE)
