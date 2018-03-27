@@ -112,8 +112,12 @@ def cb_benders_multi(model, where):
     precision_sub = master.precision_sub
     print_iter = master.print_iter  # print per print_iter iters
     verbosity = master.verbosity
+    cut_strategy = master.cut_strategy
+    nsol_keep = master.nsol_keep
     UB = 1e15
     LB = 1e-15
+    y0 = master.y0
+    yopt = None
 
     if verbosity > 2:
         print('*'*40)
@@ -149,14 +153,23 @@ def cb_benders_multi(model, where):
         fy = master._fy
         ys = master._ys
         z  = master._z
+
+        yprev = yopt
+
         if where==GRB.Callback.MIPSOL:
-            yopt = [model.cbGetSolution(y) for y in ys]
+            yopt = np.array([model.cbGetSolution(y) for y in ys])
             zmaster = model.cbGetSolution(z)
             x_dict = {x:model.cbGetSolution(x) for x in model.getVars()}
+            # Save solutions
+            master.int_sols.append(yopt)
+            # manage size
+            if len(master.int_sols)>nsol_keep:
+                master.int_sols.pop(0)
+
         elif where==GRB.Callback.MIPNODE:
             node_status = model.cbGet(GRB.Callback.MIPNODE_STATUS)
             if node_status==GRB.OPTIMAL:
-                yopt = [model.cbGetNodeRel(y) for y in ys]
+                yopt = np.array([model.cbGetNodeRel(y) for y in ys])
                 # potentially fractional relaxation
                 zmaster = model.cbGetNodeRel(z)
                 x_dict = {x:model.cbGetNodeRel(x) for x in model.getVars()}
@@ -185,6 +198,26 @@ def cb_benders_multi(model, where):
                 sub_obj = sub._weight*sub.model.ObjVal
                 sub_objs.append(sub_obj)
                 opt_sub_inds.append(sub_ind)
+                #********************************************
+                if cut_strategy in ['mw','maximal']:
+                    #****************************************
+                    # Only update core point if incumbent (int feas) found
+                    #****************************************
+                    if where==GRB.Callback.MIPSOL:
+                        if y0 is None:
+                            if len(master.int_sols)==0:
+                                pass
+                            else:
+                                yprev = master.int_sols.pop()
+                                y0 = 0.5*(yopt+yprev)
+                        else:
+                            y0 = master.update_corepoint(yopt, y0)
+                        master.y0 = y0
+                    if y0 is not None:
+                        if cut_strategy=='mw':
+                            master.solve_mw_cut(sub, y0)
+                        elif cut_strategy=='maximal':
+                            master.solve_maximal_cut(sub)
 
         # "Node solutions will usually respect previously added lazy constraints, but not always."
         # Add back all feascut, including previous ones that may have been dropped
@@ -249,10 +282,18 @@ def constraint_satisfied(constr, x_dict, feas_tol):
     Output
     True (satisfied) or False (violated)
     """
-    lhs = sum([x_dict[constr._lhs.getVar(j)]*constr._lhs.getCoeff(j) for j in range(constr._lhs.size())]) + \
-            constr._lhs.getConstant()
-    rhs = sum([x_dict[constr._rhs.getVar(j)]*constr._rhs.getCoeff(j) for j in range(constr._rhs.size())]) + \
-            constr._rhs.getConstant()
+    if hasattr(constr._lhs,'size'):
+        lhs = sum([x_dict[constr._lhs.getVar(j)]*constr._lhs.getCoeff(j)
+            for j in range(constr._lhs.size())]) +  constr._lhs.getConstant()
+    else:
+        lhs = constr._lhs
+
+    if hasattr(constr._rhs,'size'):
+        rhs = sum([x_dict[constr._rhs.getVar(j)]*constr._rhs.getCoeff(j)
+            for j in range(constr._rhs.size())]) +  constr._rhs.getConstant()
+    else:
+        rhs = constr._rhs
+
     if constr._sense==GRB.LESS_EQUAL:
         return lhs <= rhs
     elif constr._sense==GRB.GREATER_EQUAL:

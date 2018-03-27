@@ -663,6 +663,10 @@ class DecompModel(object):
     def qminos_solve(self, precision):
         csense_dict = {'=':'E', '<':'L', '>':'G'}
         model = self.model
+        #****************************************************
+        # For now, update in case constraints/vars changed
+        model.update()
+        #****************************************************
         qsolver = self.qsolver
         obj_sense = model.ModelSense
         if obj_sense==GRB.MAXIMIZE:
@@ -684,7 +688,7 @@ class DecompModel(object):
         self.xu = xu
 
         if len(ys)>0:
-            yopt = [y.X for y in ys]
+            yopt = np.array([y.X for y in ys])
             b = d - B*yopt
         else:
             b = d
@@ -879,6 +883,10 @@ class BendersMaster(object):
         self.precision_sub = 'gurobi'
         self.print_iter = 20
         self.max_iter = 1000.
+        self.y0 = None
+        self.cut_strategy = 'default'
+        self.int_sols = []
+        self.nsol_keep = 5
 
         self.model = self.init_model(ys, C, b, B, csenses_mp)
 
@@ -1025,11 +1033,15 @@ class BendersMaster(object):
         single_tree : single search tree using solver callbacks (lazy constraints)
         """
         model = self.model
+        self.cut_strategy = cut_strategy
         if two_phase:
             self.solve_relaxed(cut_strategy)
 
         if single_tree:
             model.optimize(cb_benders_multi)
+
+        yopt = np.array([y.X for y in self._ys])
+        return yopt
 
     def solve_relaxed(self, cut_strategy='default'):
         """
@@ -1054,6 +1066,8 @@ class BendersMaster(object):
         Useful for solving LP relaxation.
         """
         model = self.model
+        OutputFlag = model.Params.OutputFlag
+        model.Params.OutputFlag = 0
         max_iter = self.max_iter
         print_iter = self.print_iter
         precision_sub = self.precision_sub
@@ -1069,8 +1083,10 @@ class BendersMaster(object):
         fy = self._fy
         ys = self._ys
         z = self._z
-        yopt = np.zeros(len(ys))
-        y0 = np.array([min(1.,y.UB) for y in ys])
+        yopt = None #np.zeros(len(ys))
+        ybest = yopt
+        # y0 = np.array([min(1.,y.UB) for y in ys])
+        y0 = self.y0
 
         sub_dict = self.sub_dict
 
@@ -1087,13 +1103,25 @@ class BendersMaster(object):
             model.optimize()
             yprev = yopt
             yopt = np.array([y.X for y in ys])
+            #************************************************
+            # DEBUG TODO: hmmm....
+            # yopt = np.array([np.round(y.X) for y in ys])
+            #************************************************
             sub_objs = []
             opt_sub_inds = []
 
             # Update core point
             if cut_strategy=='mw':
-                y0 = 0.5*(y0+yopt)
-                y0[y0<model.Params.IntFeasTol] = 0.
+                if y0 is None:
+                    if yprev is None:
+                        pass
+                    else:
+                        if sum(abs(yprev-yopt))>1e-9:
+                            y0 = 0.5*(yprev+yopt)
+                            y0[y0<model.Params.IntFeasTol] = 0.
+                else:
+                    y0 = self.update_corepoint(yopt, y0)
+                    y0[y0<model.Params.IntFeasTol] = 0.
 
             for sub_ind,sub in iteritems(sub_dict):
                 sub.update_obj(yopt)
@@ -1106,16 +1134,23 @@ class BendersMaster(object):
                     sub_objs.append(sub_obj)
                     opt_sub_inds.append(sub_ind)
                     if cut_strategy=='mw':
-                        make_mw_cut(sub, y0)
+                        if y0 is not None:
+                            self.solve_mw_cut(sub, y0)
                     elif cut_strategy=='maximal':
-                        warnings.warn("Maximal cut not supported yet")
+                        if y0 is not None:
+                            self.solve_maximal_cut(sub, y0)
 
             LB = z.X
             UB = sum(fy*yopt) + sum(sub_objs)
             LB = LB if abs(LB)>1e-10 else 0.
             UB = UB if abs(UB)>1e-10 else 0.
 
-            bestUB = min(bestUB,UB)
+            if UB < bestUB:
+                bestUB = UB
+                ybest = yopt
+                # for y,yb in zip(ys,ybest):
+                #     y.Start = yb
+
             bestLB = max(bestLB,LB)
 
             gap = UB-LB
@@ -1135,10 +1170,47 @@ class BendersMaster(object):
                         cut = self.make_optcut(sub)
                         model.addConstr(cut)
 
-    def make_mw_cut(self, sub, y0):
-        pass
+        # Reset outputflag
+        model.Params.OutputFlag = OutputFlag
 
-    def make_maximal_cut(self, sub):
+        return ybest
+
+    def update_corepoint(self, yopt, y0):
+        """
+        Update core point
+        """
+        if y0 is not None:
+            y0 = 0.5*(y0 + yopt)
+
+        return y0
+
+
+    def solve_mw_cut(self, sub, y0):
+        """
+        Add or update constraint to fix objective:
+        max  u'(d-B*yc)
+        s.t. u'(d-B*yopt) = ObjVal(yopt) 
+        """
+        cons = sub.model.model.getConstrByName('fixobjval')
+        if cons is None:
+            expr = sub.model.model.getObjective() == sub.model.ObjVal
+            cons = sub.model.model.addConstr(expr, name='fixobjval')
+        else:
+            cons.RHS = sub.model.ObjVal
+            cons.Sense = GRB.EQUAL
+            obj = sub.model.model.getObjective()
+            for j in range(obj.size()):
+                v = obj.getVar(j)
+                sub.model.model.chgCoeff(cons, v, obj.getCoeff(j))
+        # Change objective function to core point
+        sub.update_obj(y0)
+        sub.model.model.update()
+        sub.model.optimize()
+        # Relax the constraint for next iteration
+        cons.Sense = GRB.LESS_EQUAL
+        cons.RHS   = GRB.INFINITY
+
+    def solve_maximal_cut(self, sub, y0):
         pass
 
 
