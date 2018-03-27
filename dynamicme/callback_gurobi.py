@@ -132,8 +132,8 @@ def cb_benders_multi(model, where):
                 nfeas = len(master.feascuts)
                 nopt = len(master.optcuts)
                 print(
-                    'Best UB=%g. Best LB=%g (MIP_OBJBND=%g). Gap=%g. Relgap=%g%%. nFeasCut=%d. nOptCut=%d'%(
-                    UB,LB,OBJBND,gap,relgap*100,nfeas,nopt))
+                    'Iter=%d. Best UB=%g. Best LB=%g (MIP_OBJBND=%g). Gap=%g. Relgap=%g%%. nFeasCut=%d. nOptCut=%d'%(
+                    _iter,UB,LB,OBJBND,gap,relgap*100,nfeas,nopt))
 
     elif where in (GRB.Callback.MIPSOL, GRB.Callback.MIPNODE):
     #elif where == GRB.Callback.MIPSOL:
@@ -152,12 +152,14 @@ def cb_benders_multi(model, where):
         if where==GRB.Callback.MIPSOL:
             yopt = [model.cbGetSolution(y) for y in ys]
             zmaster = model.cbGetSolution(z)
+            x_dict = {x:model.cbGetSolution(x) for x in model.getVars()}
         elif where==GRB.Callback.MIPNODE:
             node_status = model.cbGet(GRB.Callback.MIPNODE_STATUS)
             if node_status==GRB.OPTIMAL:
                 yopt = [model.cbGetNodeRel(y) for y in ys]
                 # potentially fractional relaxation
                 zmaster = model.cbGetNodeRel(z)
+                x_dict = {x:model.cbGetNodeRel(x) for x in model.getVars()}
             else:
                 # Then node will get fathomed anyway since infeasible
                 return
@@ -186,9 +188,13 @@ def cb_benders_multi(model, where):
 
         # "Node solutions will usually respect previously added lazy constraints, but not always."
         # Add back all feascut, including previous ones that may have been dropped
-        # for cut in master.feascuts:
-        #     ### TODO: only add violated cuts
-        #     model.cbLazy(cut)
+        n_viol = 0
+        for cut in master.feascuts:
+            if not constraint_satisfied(cut, x_dict, model.Params.FeasibilityTol):
+                model.cbLazy(cut)
+                n_viol+=1
+        if verbosity>0:
+            print("Number of previous feascuts violated: %g"%n_viol)
 
         #----------------------------------------------------
         # Get LB and UB for this node
@@ -222,11 +228,36 @@ def cb_benders_multi(model, where):
             # "Node solutions will usually respect previously added lazy constraints,
             # but not always."
             # Add back all the optcuts
+            n_viol = 0
             for cut in master.optcuts:
-                ### TODO: only add violated
-                # Violated?
-                # If so, add again to pool
-                model.cbLazy(cut)
+                # Add previous constraints that were Violated
+                if not constraint_satisfied(cut, x_dict, model.Params.FeasibilityTol):
+                    # If so, add again to pool
+                    model.cbLazy(cut)
+                    n_viol+=1
+            if verbosity>0:
+                print("Number of previous optcuts violated: %g"%n_viol)
         else:
             # Accept as new incumbent (MIPSOL) or keep exploring node (MIPNODE)
             pass
+
+
+def constraint_satisfied(constr, x_dict, feas_tol):
+    """
+    Constraint (constr) sastisfied for solution x?
+
+    Output
+    True (satisfied) or False (violated)
+    """
+    lhs = sum([x_dict[constr._lhs.getVar(j)]*constr._lhs.getCoeff(j) for j in range(constr._lhs.size())]) + \
+            constr._lhs.getConstant()
+    rhs = sum([x_dict[constr._rhs.getVar(j)]*constr._rhs.getCoeff(j) for j in range(constr._rhs.size())]) + \
+            constr._rhs.getConstant()
+    if constr._sense==GRB.LESS_EQUAL:
+        return lhs <= rhs
+    elif constr._sense==GRB.GREATER_EQUAL:
+        return lhs >= rhs
+    elif constr._sense==GRB.EQUAL:
+        return abs(lbs-rhs)<feas_tol
+    else:
+        raise ValueError("unknown constraint sense: %s"%constr._sense)

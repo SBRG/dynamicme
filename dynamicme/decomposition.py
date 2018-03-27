@@ -24,10 +24,13 @@ from cobra.solvers.gurobi_solver import _float, variable_kind_dict
 from cobra.solvers.gurobi_solver import parameter_defaults, parameter_mappings
 from cobra.solvers.gurobi_solver import sense_dict, status_dict, objective_senses, METHODS
 
+from dynamicme.callback_gurobi import cb_benders_multi
+
 import gurobipy as grb
 import numpy as np
 import cobra
 import warnings
+import time
 
 class Decomposer(object):
     def __init__(self, cobra_model, objective_sense, quadratic_component=None, solver='gurobi'):
@@ -643,12 +646,12 @@ class DecompModel(object):
             try:
                 model.optimize()
                 if model.Status==GRB.OPTIMAL:
-                    self.xopt = np.array([x.X for x in model.getVars()])
+                    #self.xopt = np.array([x.X for x in model.getVars()])
                     self.x_dict = {x.VarName:x.X for x in model.getVars()}
                     self.ObjVal = model.ObjVal
                 elif model.Status == GRB.UNBOUNDED:
                     ray = model.UnbdRay
-                    self.xopt   = ray
+                    #self.xopt   = ray
                     self.x_dict = {x.VarName:ray[j] for j,x in enumerate(model.getVars())}
                     self.ObJVal = np.nan #model.ObjVal
 
@@ -692,7 +695,7 @@ class DecompModel(object):
         nx = len(cx)
         xopt = xall[0:nx]
 
-        self.xopt = xopt
+        #self.xopt = xopt
         self.stat = stat
         self.lp_basis = hs
 
@@ -866,7 +869,7 @@ class BendersMaster(object):
         self._csenses_mp = csenses_mp
         self._x0 = xs
         self._y0 = ys
-        self._INF = 1e3
+        self._INF = 1e6
         self.optcuts = set()      # Need to keep all cuts in case they are dropped at a node
         self.feascuts = set()
         self.UB = 1e15
@@ -875,6 +878,7 @@ class BendersMaster(object):
         self.gaptol = 1e-4    # relative gap tolerance
         self.precision_sub = 'gurobi'
         self.print_iter = 20
+        self.max_iter = 1000.
 
         self.model = self.init_model(ys, C, b, B, csenses_mp)
 
@@ -900,8 +904,10 @@ class BendersMaster(object):
             cons  = model.addConstr(expr, csense, bi, name='MP_%s'%i)
 
         # Add z >= f'y + sum_k tk initially
+        # Add z = f'y + sum_k wk*tk initially
+        # and tk >= ...
         rhs = LinExpr(fy, ys)
-        model.addConstr(z, GRB.GREATER_EQUAL, rhs, 'z_cut')
+        model.addConstr(z, GRB.EQUAL, rhs, 'z_cut')
 
         # Set objective: min z
         model.setObjective(z, GRB.MINIMIZE)
@@ -937,17 +943,17 @@ class BendersMaster(object):
             tk = self.model.getVarByName(tk_id)
             if tk is None:
                 tk = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,tk_id)
-            # Update z cut: z >= f'y + sum_k wk*tk
-            # z - f'y - sum_k wk*tk >= 0
+            # Update z cut: z = f'y + sum_k wk*tk
+            # z - f'y - sum_k wk*tk = 0
             wk = v._weight
             self.model.chgCoeff(zcut, tk, -wk)
 
         self.model.update()
 
 
-    def make_optcut(self, sub):
+    def make_optcut(self, sub, cut_type='multi'):
         """
-        z >= f'y + sum_k tki,                           i \in OptimalityCuts
+        z == f'y + sum_k tki,                           i \in OptimalityCuts
         (Above remains the same. Just append to tk)
         tki >= (dk-By)'wA_i,k + lk*wl_i,k - uk*wu_i,k,  i \in OptimalityCuts
         """
@@ -1005,6 +1011,138 @@ class BendersMaster(object):
             print('Caught GurobiError (%s) in make_feascut'%repr(e))
 
         return cut
+
+    def optimize(self, two_phase=False, cut_strategy='default', single_tree=True):
+        """
+        Optimize, possibly using various improvements.
+
+        Inputs
+        two_phase : phase 1 (LP relaxation), phase 2 (original, keeping P1 cuts)
+        cut_strategy :
+            None (default, one cut per subproblem),
+            "mw" (Magnanti-Wong non-dominated),
+            "maximal" (Sherali-Lunday cuts)
+        single_tree : single search tree using solver callbacks (lazy constraints)
+        """
+        model = self.model
+        if two_phase:
+            self.solve_relaxed(cut_strategy)
+
+        if single_tree:
+            model.optimize(cb_benders_multi)
+
+    def solve_relaxed(self, cut_strategy='default'):
+        """
+        Solve LP relaxation.
+        """
+        model = self.model
+        OutputFlag = model.Params.OutputFlag
+        ytypes = [y.VType for y in self._ys]
+        model.Params.OutputFlag = 0
+        for y in self._ys:
+            y.VType = GRB.CONTINUOUS
+        self.solve_loop(cut_strategy)
+
+        # Make integer/binary again
+        for y,yt in zip(self._ys,ytypes):
+            y.VType = yt
+        model.Params.OutputFlag = OutputFlag
+
+    def solve_loop(self, cut_strategy='default'):
+        """
+        Solve without callbacks.
+        Useful for solving LP relaxation.
+        """
+        model = self.model
+        max_iter = self.max_iter
+        print_iter = self.print_iter
+        precision_sub = self.precision_sub
+        cut_strategy = cut_strategy.lower()
+        UB = 1e15
+        LB = -1e15
+        gap = UB-LB
+        relgap = gap/(1e-10+abs(UB))
+        bestUB = UB
+        bestLB = LB
+        gaptol = self.gaptol
+
+        fy = self._fy
+        ys = self._ys
+        z = self._z
+        yopt = np.zeros(len(ys))
+        y0 = np.array([min(1.,y.UB) for y in ys])
+
+        sub_dict = self.sub_dict
+
+        tic = time.time()
+        print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+            'Iter','UB','LB','Best UB','Best LB','gap','relgap(%)','time(s)'))
+
+        for _iter in range(max_iter):
+            if np.mod(_iter, print_iter)==0:
+                toc = time.time()-tic
+                print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                    _iter,UB,LB,bestUB,bestLB,gap,relgap*100,toc))
+
+            model.optimize()
+            yprev = yopt
+            yopt = np.array([y.X for y in ys])
+            sub_objs = []
+            opt_sub_inds = []
+
+            # Update core point
+            if cut_strategy=='mw':
+                y0 = 0.5*(y0+yopt)
+                y0[y0<model.Params.IntFeasTol] = 0.
+
+            for sub_ind,sub in iteritems(sub_dict):
+                sub.update_obj(yopt)
+                sub.model.optimize(precision=precision_sub)
+                if sub.model.Status==GRB.Status.UNBOUNDED:
+                    feascut = self.make_feascut(sub)
+                    model.addConstr(feascut)
+                else:
+                    sub_obj = sub._weight*sub.model.ObjVal
+                    sub_objs.append(sub_obj)
+                    opt_sub_inds.append(sub_ind)
+                    if cut_strategy=='mw':
+                        make_mw_cut(sub, y0)
+                    elif cut_strategy=='maximal':
+                        warnings.warn("Maximal cut not supported yet")
+
+            LB = z.X
+            UB = sum(fy*yopt) + sum(sub_objs)
+            LB = LB if abs(LB)>1e-10 else 0.
+            UB = UB if abs(UB)>1e-10 else 0.
+
+            bestUB = min(bestUB,UB)
+            bestLB = max(bestLB,LB)
+
+            gap = UB-LB
+            relgap = gap/(1e-10+abs(UB))
+
+            if relgap < gaptol:
+                toc = time.time()-tic
+                print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                    _iter,UB,LB,bestUB,bestLB,gap,relgap*100,toc))
+                print("relgap (%g) < gaptol (%g). Done!"%(relgap, gaptol))
+                break
+            else:
+                for k,sub_ind in enumerate(opt_sub_inds):
+                    tk = model.getVarByName('tk_%s'%sub_ind)
+                    sub = sub_dict[sub_ind]
+                    if tk.X < sub_objs[k]:
+                        cut = self.make_optcut(sub)
+                        model.addConstr(cut)
+
+    def make_mw_cut(self, sub, y0):
+        pass
+
+    def make_maximal_cut(self, sub):
+        pass
+
+
+
 
 
 class BendersSubmodel(object):

@@ -79,7 +79,7 @@ class RadixEstimator(Estimator):
             col_meas_id (default: 'output_id')
             col_meas_val (default: 'output')
             col_ind (default: 'cond')
-            reg_weight (default: 1e-3)
+            reg_weight (default: 0.)
             max_nonzero_binaries (default: None)
             optimize : if True, solve now, else just build model (default: True).
         """
@@ -94,7 +94,7 @@ class RadixEstimator(Estimator):
         col_meas_val = 'output'
         col_meas_id  = 'output_id'
         col_ind  = 'cond'
-        reg_weight = 1e-3
+        reg_weight = 0.
         max_nonzero_binaries = None
         optimize = True
 
@@ -207,7 +207,7 @@ class RadixEstimator(Estimator):
 
 
     def make_objective(self, df_meas, col_meas_id, col_meas_val, col_ind,
-            objective='minerr', reg_weight=1e-3,
+            objective='minerr', reg_weight=1e-4,
             reset_obj=True):
         """
         Make objective function of type objective.
@@ -233,7 +233,7 @@ class RadixEstimator(Estimator):
 
                     sp = Variable('sp_%s'%mdl_ind, lower_bound=0., upper_bound=INF)
                     sn = Variable('sn_%s'%mdl_ind, lower_bound=0., upper_bound=INF)
-                    weight = (1-reg_weight)/(abs(x_meas) + 1) 
+                    weight = (1-reg_weight)/(abs(x_meas) + 1)
                     sp.objective_coefficient = weight
                     sn.objective_coefficient = weight
                     cons = Constraint('abs_err_%s'%mdl_ind)
