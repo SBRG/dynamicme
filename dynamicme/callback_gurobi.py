@@ -109,7 +109,10 @@ def cb_benders_multi(model, where):
         print('Need model._master = master')
         raise Exception('Need model._master = master')
 
-    GAPTOL = master.gaptol
+    #GAPTOL = master.gaptol
+    #GAPABS = master.absgaptol
+    GAPTOL = model.Params.MIPGap
+    GAPABS = model.Params.MIPGapAbs
     precision_sub = master.precision_sub
     print_iter = master.print_iter  # print per print_iter iters
     verbosity = master.verbosity
@@ -181,10 +184,14 @@ def cb_benders_multi(model, where):
         sub_dict = master.sub_dict
         sub_objs = []
         opt_sub_inds = []
-
+        master._iter += 1# Update global iter for maximal cut
         # Solve submodels, collect objs, and calculate UB
         for sub_ind, sub in iteritems(sub_dict):
-            sub.update_obj(yopt)
+            if cut_strategy=='maximal' and y0 is not None:
+                iter_mp = master._iter
+                sub.update_maximal_obj(yopt, y0, iter_mp, GAPABS)
+            else:
+                sub.update_obj(yopt)
             sub.model.optimize(precision=precision_sub)
             if verbosity>1:
                 print('Submodel %s status = %s (%s)'%(
@@ -259,8 +266,6 @@ def cb_benders_multi(model, where):
                             else:
                                 if verbosity>1:
                                     print("ObjVal(%g) too big for MW cut!"%sub.model.ObjVal)
-                        elif cut_strategy=='maximal':
-                            master.solve_maximal_cut(sub)
 
         # "Node solutions will usually respect previously added lazy constraints, but not always."
         # Add back all feascut, including previous ones that may have been dropped

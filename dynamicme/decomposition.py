@@ -194,6 +194,7 @@ class Decomposer(object):
         master._decomposer = self   # Need this reference to access methods inside callback
         master._verbosity = 0
         master._gaptol = 1e-4   # relative gaptol
+        master._absgaptol = 1e-6   # absolute gaptol
         master._precision_sub = 'double'
 
         master.Params.Presolve = 0          # To be safe, turn off
@@ -879,6 +880,7 @@ class BendersMaster(object):
         self.LB = -1e100
         self.verbosity = 0
         self.gaptol = 1e-4    # relative gap tolerance
+        self.absgaptol = 1e-6    # relative gap tolerance
         self.precision_sub = 'gurobi'
         self.print_iter = 20
         self.max_iter = 1000.
@@ -887,6 +889,7 @@ class BendersMaster(object):
         self.int_sols = []
         self.nsol_keep = 5
         self.x_dict = {}
+        self._iter = 0.
 
         self.model = self.init_model(ys, C, b, B, csenses_mp)
 
@@ -1045,9 +1048,14 @@ class BendersMaster(object):
         self.cut_strategy = cut_strategy
         if two_phase:
             self.solve_relaxed(cut_strategy)
+            # Reset umaxs
+            for sub in self.sub_dict.values():
+                sub.maximal_dict['u']=None
 
         if single_tree:
             model.optimize(cb_benders_multi)
+        else:
+            self.solve_loop(cut_strategy)
 
         # Sometimes heuristic finds incumbent s.t. previous constraints
         # that is within gap without chance to exclude that incumbent
@@ -1092,6 +1100,8 @@ class BendersMaster(object):
         bestUB = UB
         bestLB = LB
         gaptol = self.gaptol
+        absgaptol = self.absgaptol
+        verbosity = self.verbosity
 
         fy = self._fy
         ys = self._ys
@@ -1104,31 +1114,47 @@ class BendersMaster(object):
         sub_dict = self.sub_dict
 
         tic = time.time()
-        print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
-            'Iter','UB','LB','Best UB','Best LB','gap','relgap(%)','time(s)'))
+        if cut_strategy=='maximal':
+            print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                'Iter','UB','LB','Best UB','umax','gap','relgap(%)','time(s)'))
+        else:
+            print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                'Iter','UB','LB','Best UB','Best LB','gap','relgap(%)','time(s)'))
 
         for _iter in range(max_iter):
             if np.mod(_iter, print_iter)==0:
                 toc = time.time()-tic
-                print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
-                    _iter,UB,LB,bestUB,bestLB,gap,relgap*100,toc))
+                if cut_strategy=='maximal':
+                    umax = max([sub.maximal_dict['u'] for sub in sub_dict.values()])
+                    umaxf = umax if umax is not None else np.inf
+                    print("%12.10s%12.8s%12.8s%12.8s%12.4g%12.8s%12.10s%12.8s" % (
+                        _iter,UB,LB,bestUB,umaxf,gap,relgap*100,toc))
+                else:
+                    print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                        _iter,UB,LB,bestUB,bestLB,gap,relgap*100,toc))
 
             model.optimize()
             yprev = yopt
             yopt = np.array([y.X for y in ys])
+            self.int_sols.append(yopt)
+            if len(self.int_sols)>self.nsol_keep:
+                self.int_sols.pop(0)
             #************************************************
             # DEBUG TODO: hmmm....
+            # No need to round. Subgradient of LP relaxation is still
+            # a subgradient of integer problem.
             # yopt = np.array([np.round(y.X) for y in ys])
             #************************************************
             sub_objs = []
             opt_sub_inds = []
 
             # Update core point
-            if cut_strategy=='mw':
+            if cut_strategy in ['mw','maximal']:
                 if y0 is None:
                     if yprev is None:
                         pass
                     else:
+                        # Wait till we have at least two int sols
                         if sum(abs(yprev-yopt))>1e-9:
                             y0 = 0.5*(yprev+yopt)
                             y0[y0<model.Params.IntFeasTol] = 0.
@@ -1137,26 +1163,51 @@ class BendersMaster(object):
                     y0[y0<model.Params.IntFeasTol] = 0.
 
             for sub_ind,sub in iteritems(sub_dict):
-                sub.update_obj(yopt)
+                if cut_strategy=='maximal' and y0 is not None:
+                    sub.update_maximal_obj(yopt,y0,_iter,absgaptol)
+                else:
+                    sub.update_obj(yopt)
                 sub.model.optimize(precision=precision_sub)
+                #********************************************
+                # Elaborate procedure to repair MW cuts
+                if sub.model.Status == GRB.Status.INFEASIBLE:
+                    if verbosity>0:
+                        print("Submodel %s is infeasible! Attempting fix."%sub_ind)
+                    if cut_strategy=='mw':
+                        # Try to get a normal optimality cut instead.
+                        # Alternatively, might have been nearly unbounded.
+                        cons = sub.model.getConstrByName('fixobjval')
+                        if verbosity>1:
+                            print("fixobjval: %s %s %s"%(
+                                sub.model.getRow(cons), cons.Sense, cons.RHS))
+                        if cons is not None:
+                            # Drastic:
+                            sub.model.model.remove(cons)
+                            sub.model.model.update()
+                            sub.model.optimize(precision=precision_sub)
+                            if verbosity>0:
+                                if sub.model.Status==GRB.Status.INFEASIBLE:
+                                    print("****************************")
+                                    print("Could not make submodel %s feasible"%sub_ind)
+                                else:
+                                    print("Submodel without mw constraint: %s (%s)"%(
+                                        status_dict[sub.model.Status],sub.model.Status))
+                #********************************************
                 if sub.model.Status==GRB.Status.UNBOUNDED:
                     feascut = self.make_feascut(sub)
                     model.addConstr(feascut)
-                else:
+                elif sub.model.Status==GRB.Status.OPTIMAL:
                     sub_obj = sub._weight*sub.model.ObjVal
                     sub_objs.append(sub_obj)
                     opt_sub_inds.append(sub_ind)
                     if cut_strategy=='mw':
                         if y0 is not None:
                             self.solve_mw_cut(sub, y0)
-                    elif cut_strategy=='maximal':
-                        if y0 is not None:
-                            self.solve_maximal_cut(sub, y0)
 
             LB = z.X
             UB = sum(fy*yopt) + sum(sub_objs)
-            LB = LB if abs(LB)>1e-10 else 0.
-            UB = UB if abs(UB)>1e-10 else 0.
+            # LB = LB if abs(LB)>1e-10 else 0.
+            # UB = UB if abs(UB)>1e-10 else 0.
 
             if UB < bestUB:
                 bestUB = UB
@@ -1167,7 +1218,7 @@ class BendersMaster(object):
 
             bestLB = LB
             gap = bestUB-LB
-            relgap = gap/(1e-10+abs(UB))
+            relgap = gap/(1e-10+abs(bestUB))
 
             if relgap < gaptol:
                 toc = time.time()-tic
@@ -1197,7 +1248,6 @@ class BendersMaster(object):
 
         return y0
 
-
     def solve_mw_cut(self, sub, y0):
         """
         Add or update constraint to fix objective:
@@ -1217,21 +1267,21 @@ class BendersMaster(object):
                 v = row.getVar(j)
                 sub.model.chgCoeff(cons, v, 0.)
             # Update actual coefficients
-            obj = sub.model.model.getObjective()
+            obj = sub.model.getObjective()
             for j in range(obj.size()):
                 v = obj.getVar(j)
                 sub.model.chgCoeff(cons, v, obj.getCoeff(j))
         # Change objective function to core point
         sub.update_obj(y0)
-        sub.model.model.update()
+        sub.model.update()
         sub.model.optimize()
+        if sub.model.Status==GRB.Status.INFEASIBLE:
+            print("Submodel %s Infeasible after adding mw constraint"%sub._id)
+            raise Exception("Submodel %s Infeasible after adding mw constraint"%sub._id)
         # Relax the constraint for next iteration
         cons.Sense = GRB.GREATER_EQUAL
         cons.RHS   = -GRB.INFINITY
-        sub.model.model.update()
-
-    def solve_maximal_cut(self, sub, y0):
-        pass
+        sub.model.update()
 
 
 
@@ -1257,6 +1307,7 @@ class BendersSubmodel(object):
         self._y0 = DictList(ys)
         self._mets_d = mets_d
         self._mets_b = mets_b
+        self.maximal_dict = {'u':None, 'L':2., 'M':1.}
 
         self.model = self.init_model(xs, A, d, csenses)
         self.primal = None
@@ -1322,8 +1373,6 @@ class BendersSubmodel(object):
         wu = self._wu
         xl = self._xl
         xu = self._xu
-        m,ny = B.shape
-        n = len(xl)
 
         dBy = d - B*yopt
         cinds = dBy.nonzero()[0]
@@ -1334,6 +1383,90 @@ class BendersSubmodel(object):
             model.update()
         except GurobiError as e:
             print('Caught GurobiError (%s) in update_subobj(yopt=%s)'%(repr(e),yopt))
+
+    def update_maximal_obj(self, yopt, ycore, _iter, absgaptol=1e-6):
+        """
+        Maximal cuts by Sherali and Lunday (2013) Ann Oper Res, 210:57-72.
+        Weight update scheme by Oliveira et al. (2014) Comput Oper Res, 49:47-58.
+
+        For MIP:
+        min  c'x + f'y
+        s.t. Ax + By = b
+             Cy = d
+             xl <= x <= xu
+             y integer
+
+        Solve the dual subproblem:
+        #----------------------------------------------------
+        max  w'(b-B*yopt) + u*w'(b-B*ycore) + xl'wl - xu'wu
+        s.t. w'A = c
+        #----------------------------------------------------
+
+        Critically, u must be small enough that
+        UB - LB <= absgaptol at optimality
+        i.e.,
+        w'(b-B*yopt) + l'wl - u'wu  + u*w'(b-B*ycore) - z <= absgaptol
+
+        Additionally,
+        update weights (to guarantee convergence):
+        sum_k=1,...,inf uk --> inf and
+        uk --> 0 as k --> inf
+        E.g., u{k+1} = alpha{k+1}*u{k}
+        where alpha{k+1} = l/k,
+        where l=2, k is the iteration number,
+        and u{0} = absgaptol/(M*theta),
+        where theta=absgaptol + max{0,max{boi}} - min{0,min{boi}},
+        with bo = b-B*yopt,
+        and M is the penalty for infeasibility
+
+        Note dual of modified dual subproblem is
+        min  c'x
+        s.t. Ax = b-B*yopt + u*(b-B*ycore)
+        """
+        model = self.model
+        d = self._d
+        B = self._B
+        wa = self._wa
+        wl = self._wl
+        wu = self._wu
+        xl = self._xl
+        xu = self._xu
+        maximal_dict = self.maximal_dict
+        umax = maximal_dict['u']
+        L = maximal_dict['L']
+        M = maximal_dict['M']
+
+        dBy = d - B*yopt
+        dByc = d - B*ycore
+        #----------------------------------------------------
+        # Update weight
+        if _iter<=0 or umax is None:
+            maxboi = max(dByc)
+            minboi = min(dByc)
+            theta = absgaptol + max(0,maxboi)-min(0,minboi)
+            #theta = max(0,maxboi)-min(0,minboi)
+            umax = absgaptol/theta
+            #umax = min(umax, absgaptol)
+        else:
+            # alpha = L/max(1.,_iter)
+            alpha = 1/np.log10(max(10.,_iter))
+            umax = alpha*umax
+
+        self.maximal_dict['u'] = umax
+        #----------------------------------------------------
+        u_dByc = umax*dByc
+        cinds = dBy.nonzero()[0]
+        cinds_c = u_dByc.nonzero()[0]
+        try:
+            dBywa = LinExpr([dBy[j] for j in cinds], [wa[j] for j in cinds])
+            dByc_wa = LinExpr([u_dByc[j] for j in cinds_c], [wa[j] for j in cinds_c])
+            obj = dBywa + dByc_wa + LinExpr(xl,wl) - LinExpr(xu,wu)
+
+            model.setObjective(obj, GRB.MAXIMIZE)
+            model.update()
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in update_subobj(yopt=%s)'%(repr(e),yopt))
+
 
     def make_update_primal(self, yopt, cx=None, obj_sense='minimize'):
         """
