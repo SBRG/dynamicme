@@ -12,6 +12,7 @@ from six import iteritems
 from builtins import range
 
 from gurobipy import *
+from cobra.solvers.gurobi_solver import status_dict
 
 import numpy as np
 
@@ -114,7 +115,7 @@ def cb_benders_multi(model, where):
     verbosity = master.verbosity
     cut_strategy = master.cut_strategy
     nsol_keep = master.nsol_keep
-    UB = 1e15
+    UB = 1e100
     LB = 1e-15
     y0 = master.y0
     yopt = None
@@ -186,7 +187,8 @@ def cb_benders_multi(model, where):
             sub.update_obj(yopt)
             sub.model.optimize(precision=precision_sub)
             if verbosity>1:
-                print('Submodel %s status = %s'%(sub_ind, sub.model.Status))
+                print('Submodel %s status = %s (%s)'%(
+                    sub_ind, status_dict[sub.model.Status], sub.model.Status))
 
             if sub.model.Status == GRB.Status.UNBOUNDED:
                 # Add feasibility cut, ensuring that cut indeed elimi current incumbent
@@ -194,7 +196,44 @@ def cb_benders_multi(model, where):
                 feascut = master.make_feascut(sub)
                 master.feascuts.add(feascut)
                 model.cbLazy(feascut)   # Add to lazy constraint pool 
-            else:
+            elif sub.model.Status == GRB.Status.INFEASIBLE:
+                """
+                Can happen if:
+                a) using cut_strategy='mw' and fixobjval constraint is infeasible,
+                b) if primal is unbounded ==> not likely since primal box constrained,
+                c) solver mistakes unbounded for infeasible.
+                """
+                if verbosity>1:
+                    print("Submodel %s is infeasible! Attempting fix."%sub_ind)
+                if cut_strategy=='mw':
+                    # Try to get a normal optimality cut instead.
+                    # Alternatively, might have been nearly unbounded.
+                    cons = sub.model.getConstrByName('fixobjval')
+                    if verbosity>1:
+                        print("fixobjval: %s %s %s"%(
+                            sub.model.getRow(cons), cons.Sense, cons.RHS))
+                    if cons is not None:
+                        # Drastic:
+                        sub.model.model.remove(cons)
+                        sub.model.model.update()
+                        sub.model.optimize(precision=precision_sub)
+                        if verbosity>0:
+                            if sub.model.Status==GRB.Status.INFEASIBLE:
+                                print("****************************")
+                                print("Could not make submodel %s feasible"%sub_ind)
+                            else:
+                                print("Submodel without mw constraint: %s (%s)"%(
+                                    status_dict[sub.model.Status],sub.model.Status))
+                        # cons.Sense = GRB.GREATER_EQUAL
+                        # cons.RHS   = -GRB.INFINITY
+                        # sub.model.update()
+                        # sub.model.optimize(precision=precision_sub)
+                else:
+                    cut = sub.repair_infeas(master, yopt)
+                    if cut is not None:
+                        model.cbLazy(cut)   # Add to lazy constraint pool 
+
+            if sub.model.Status == GRB.Status.OPTIMAL:
                 sub_obj = sub._weight*sub.model.ObjVal
                 sub_objs.append(sub_obj)
                 opt_sub_inds.append(sub_ind)
@@ -215,7 +254,11 @@ def cb_benders_multi(model, where):
                         master.y0 = y0
                     if y0 is not None:
                         if cut_strategy=='mw':
-                            master.solve_mw_cut(sub, y0)
+                            if abs(sub.model.ObjVal)<1e6:
+                                master.solve_mw_cut(sub, y0)
+                            else:
+                                if verbosity>1:
+                                    print("ObjVal(%g) too big for MW cut!"%sub.model.ObjVal)
                         elif cut_strategy=='maximal':
                             master.solve_maximal_cut(sub)
 
@@ -226,12 +269,13 @@ def cb_benders_multi(model, where):
             if not constraint_satisfied(cut, x_dict, model.Params.FeasibilityTol):
                 model.cbLazy(cut)
                 n_viol+=1
-        if verbosity>0:
+        if verbosity>1:
             print("Number of previous feascuts violated: %g"%n_viol)
 
         #----------------------------------------------------
-        # Get LB and UB for this node
+        # Get LB and UB for this node (subspace of full problem space)
         LB = zmaster
+        # UB for this incumbent (MIPSOL) or fractional solution (MIPNODE)
         UB = sum(fy*yopt) + sum(sub_objs)
 
         # Update global bounds
@@ -256,6 +300,8 @@ def cb_benders_multi(model, where):
                 sub = sub_dict[sub_ind]
                 optcut = master.make_optcut(sub)
                 master.optcuts.add(optcut)
+                # cut produces an extreme point even if y fractional.
+                # If fractional, can it exclude incumbent?
                 model.cbLazy(optcut)    # Add to lazy constraint pool
 
             # "Node solutions will usually respect previously added lazy constraints,
@@ -268,7 +314,7 @@ def cb_benders_multi(model, where):
                     # If so, add again to pool
                     model.cbLazy(cut)
                     n_viol+=1
-            if verbosity>0:
+            if verbosity>1:
                 print("Number of previous optcuts violated: %g"%n_viol)
         else:
             # Accept as new incumbent (MIPSOL) or keep exploring node (MIPNODE)

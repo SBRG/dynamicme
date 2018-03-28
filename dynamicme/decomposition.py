@@ -596,12 +596,6 @@ class StackedDecomposer(Decomposer):
         return sub_wrapper
 
 
-
-
-
-
-
-
 class DecompModel(object):
     """
     Class for Benders decomposition
@@ -768,7 +762,10 @@ def split_cobra(model):
     dmix = d0[d_rows]
     csenses_mix = csenses0[d_rows]
 
-    return Amix, Bmix, dmix, csenses_mix, xs, ys, C, b, bsenses
+    mets_b = [model.metabolites[i] for i in b_rows]
+    mets_d = [model.metabolites[i] for i in d_rows]
+
+    return Amix, Bmix, dmix, csenses_mix, xs, ys, C, b, bsenses, mets_d, mets_b
 
 
 
@@ -861,7 +858,7 @@ class BendersMaster(object):
     def __init__(self, cobra_model, solver='gurobi'):
         self.cobra_model = cobra_model
         self.sub_dict = {}
-        A,B,d,csenses,xs,ys,C,b,csenses_mp = split_cobra(cobra_model)
+        A,B,d,csenses,xs,ys,C,b,csenses_mp,mets_d,mets_b = split_cobra(cobra_model)
         self._A = A
         self._Acsc = A.tocsc()
         self._B = B
@@ -873,11 +870,13 @@ class BendersMaster(object):
         self._csenses_mp = csenses_mp
         self._x0 = xs
         self._y0 = ys
+        self._mets_d = mets_d
+        self._mets_b = mets_b
         self._INF = 1e6
         self.optcuts = set()      # Need to keep all cuts in case they are dropped at a node
         self.feascuts = set()
-        self.UB = 1e15
-        self.LB = -1e15
+        self.UB = 1e100
+        self.LB = -1e100
         self.verbosity = 0
         self.gaptol = 1e-4    # relative gap tolerance
         self.precision_sub = 'gurobi'
@@ -887,6 +886,7 @@ class BendersMaster(object):
         self.cut_strategy = 'default'
         self.int_sols = []
         self.nsol_keep = 5
+        self.x_dict = {}
 
         self.model = self.init_model(ys, C, b, B, csenses_mp)
 
@@ -1020,6 +1020,15 @@ class BendersMaster(object):
 
         return cut
 
+    def make_feascut_from_primal(self, sub):
+        """
+        Make feascut using FarkasDual of primal.
+        """
+        cut = None
+
+        return cut
+
+
     def optimize(self, two_phase=False, cut_strategy='default', single_tree=True):
         """
         Optimize, possibly using various improvements.
@@ -1039,6 +1048,10 @@ class BendersMaster(object):
 
         if single_tree:
             model.optimize(cb_benders_multi)
+
+        # Sometimes heuristic finds incumbent s.t. previous constraints
+        # that is within gap without chance to exclude that incumbent
+        # with cuts based on integer solution
 
         yopt = np.array([y.X for y in self._ys])
         return yopt
@@ -1072,8 +1085,8 @@ class BendersMaster(object):
         print_iter = self.print_iter
         precision_sub = self.precision_sub
         cut_strategy = cut_strategy.lower()
-        UB = 1e15
-        LB = -1e15
+        UB = 1e100
+        LB = -1e100
         gap = UB-LB
         relgap = gap/(1e-10+abs(UB))
         bestUB = UB
@@ -1148,12 +1161,12 @@ class BendersMaster(object):
             if UB < bestUB:
                 bestUB = UB
                 ybest = yopt
+                self.x_dict = {v.VarName:v.X for v in model.getVars()}
                 # for y,yb in zip(ys,ybest):
                 #     y.Start = yb
 
-            bestLB = max(bestLB,LB)
-
-            gap = UB-LB
+            bestLB = LB
+            gap = bestUB-LB
             relgap = gap/(1e-10+abs(UB))
 
             if relgap < gaptol:
@@ -1189,7 +1202,7 @@ class BendersMaster(object):
         """
         Add or update constraint to fix objective:
         max  u'(d-B*yc)
-        s.t. u'(d-B*yopt) = ObjVal(yopt) 
+        s.t. u'(d-B*yopt) = ObjVal(yopt)
         """
         cons = sub.model.model.getConstrByName('fixobjval')
         if cons is None:
@@ -1198,22 +1211,27 @@ class BendersMaster(object):
         else:
             cons.RHS = sub.model.ObjVal
             cons.Sense = GRB.EQUAL
+            # Reset all coeffs
+            row = sub.model.getRow(cons)
+            for j in range(row.size()):
+                v = row.getVar(j)
+                sub.model.chgCoeff(cons, v, 0.)
+            # Update actual coefficients
             obj = sub.model.model.getObjective()
             for j in range(obj.size()):
                 v = obj.getVar(j)
-                sub.model.model.chgCoeff(cons, v, obj.getCoeff(j))
+                sub.model.chgCoeff(cons, v, obj.getCoeff(j))
         # Change objective function to core point
         sub.update_obj(y0)
         sub.model.model.update()
         sub.model.optimize()
         # Relax the constraint for next iteration
-        cons.Sense = GRB.LESS_EQUAL
-        cons.RHS   = GRB.INFINITY
+        cons.Sense = GRB.GREATER_EQUAL
+        cons.RHS   = -GRB.INFINITY
+        sub.model.model.update()
 
     def solve_maximal_cut(self, sub, y0):
         pass
-
-
 
 
 
@@ -1225,7 +1243,7 @@ class BendersSubmodel(object):
         self._id = _id
         self.cobra_model = cobra_model
         self._weight = weight
-        A,B,d,csenses,xs,ys,C,b,csenses_mp = split_cobra(cobra_model)
+        A,B,d,csenses,xs,ys,C,b,csenses_mp,mets_d,mets_b = split_cobra(cobra_model)
         self._A = A
         self._Acsc = A.tocsc()
         self._B = B
@@ -1237,8 +1255,11 @@ class BendersSubmodel(object):
         self._csenses_mp = csenses_mp
         self._x0 = DictList(xs)
         self._y0 = DictList(ys)
+        self._mets_d = mets_d
+        self._mets_b = mets_b
 
         self.model = self.init_model(xs, A, d, csenses)
+        self.primal = None
 
     def init_model(self, xs0, A, d, csenses):
         INF = GRB.INFINITY
@@ -1246,7 +1267,7 @@ class BendersSubmodel(object):
         m = len(d)
         n = len(xs0)
         nx = n
-        model = grb.Model('sub')
+        model = grb.Model('dual')
         model.Params.InfUnbdInfo = 1
         model.Params.OutputFlag = 0
         csenses = [sense_dict[c] for c in csenses]
@@ -1314,6 +1335,87 @@ class BendersSubmodel(object):
         except GurobiError as e:
             print('Caught GurobiError (%s) in update_subobj(yopt=%s)'%(repr(e),yopt))
 
+    def make_update_primal(self, yopt, cx=None, obj_sense='minimize'):
+        """
+        Make or update primal problem.
+        min  c'x + f'y
+        s.t. Ax = d-By
+             l<=x<=u
+        """
+        csenses = self._csenses
+        A = self._A
+        B = self._B
+        d = self._d
+        mets_d = self._mets_d
+        xs0 = self._x0  # DictList of cobra vars
+        ys0 = self._y0
+
+        if self.primal is None:
+            xl= np.array([x.lower_bound for x in xs0])
+            xu= np.array([x.upper_bound for x in xs0])
+            if cx is None:
+                cx= np.array([x.objective_coefficient for x in xs0])
+
+            model = grb.Model('primal')
+            model.Params.InfUnbdInfo=1
+            model.Params.OutputFlag=0
+
+            csenses = [sense_dict[c] for c in csenses]
+            xs = [model.addVar(x.lower_bound, x.upper_bound, x.objective_coefficient,
+                variable_kind_dict[x.variable_kind], x.id) for x in xs0]
+
+            # Ax = d-By
+            By = B*yopt
+            Am = A.shape[0]
+            for i in range(Am):
+                met    = mets_d[i]
+                csense = csenses[i]
+                di     = d[i]
+                #------------------------------------------------
+                cinds  = A.indices[A.indptr[i]:A.indptr[i+1]]
+                coefs  = A.data[A.indptr[i]:A.indptr[i+1]]
+                lhs    = LinExpr(coefs, [xs[j] for j in cinds])
+                rhs    = di-By[i]
+                #------------------------------------------------
+                cons   = model.addConstr(lhs, csense, rhs, name=met.id)
+
+            # Objective: min(max) c'x
+            obj = LinExpr(cx, xs)
+            model.setObjective(obj, objective_senses[obj_sense])
+            model.update()
+
+            self.primal = model
+        else:
+            model = self.primal
+            # Update: Ax = d-B*yopt
+            By = B*yopt
+            for i,cons in enumerate(model.getConstrs()):
+                cons.RHS = d[i]-By[i]
+            # Updated objective provided for some reason?
+            if cx is not None:
+                xs  = model.getVars()
+                obj = LinExpr(cx, xs)
+                model.setObjective(obj, objective_senses[obj_sense])
+
+            model.update()
+
+        return model
+
+
+    def repair_infeas(self, master, yopt):
+        """
+        Happens if primal is unbounded.
+        But, at minimum we have box constraints on primal.
+        Therefore, this case only arises when solver mistakes unbounded
+        for infeasible.
+        If this happens, attempt to fix the situation by
+        solving the sub primal and using FarkasDual to get the unbounded ray of dual.
+        """
+        primal = self.make_update_primal(yopt)
+        feascut = master.make_feascut_from_primal(self)
+
+        return feascut
+
 
 class LagrangeSubmodel(object):
     """
@@ -1332,7 +1434,7 @@ class LagrangeSubmodel(object):
         self._id = _id
         self.cobra_model = cobra_model
         self._weight = weight
-        A,B,d,dsenses,xs,ys,C,b,bsenses = split_cobra(cobra_model)
+        A,B,d,dsenses,xs,ys,C,b,bsenses,mets_d,mets_b = split_cobra(cobra_model)
         self._A = A
         self._Acsc = A.tocsc()
         self._B = B
@@ -1344,6 +1446,8 @@ class LagrangeSubmodel(object):
         self._bsenses = bsenses
         self._x0 = DictList(xs)
         self._y0 = DictList(ys)
+        self._mets_d = mets_d
+        self._mets_b = mets_b
         self._H = None
 
         # self.model = self.init_model(xs, A, d, csenses)
@@ -1456,7 +1560,7 @@ class LagrangeMaster(object):
     def __init__(self, cobra_model, solver='gurobi'):
         self.cobra_model = cobra_model
         self.sub_dict = {}
-        A,B,d,csenses,xs,ys,C,b,csenses_mp = split_cobra(cobra_model)
+        A,B,d,csenses,xs,ys,C,b,csenses_mp,mets_d,mets_b = split_cobra(cobra_model)
         self._A = A
         self._Acsc = A.tocsc()
         self._B = B
@@ -1468,6 +1572,8 @@ class LagrangeMaster(object):
         self._csenses_mp = csenses_mp
         self._x0 = xs
         self._y0 = ys
+        self._mets_d = mets_d
+        self._mets_b = mets_b
         self._INF = 1e3
 
         self.model = self.init_model(ys)
