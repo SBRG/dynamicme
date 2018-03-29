@@ -1652,6 +1652,7 @@ class LagrangeSubmodel(object):
         fy = self._fy
         cx = self._cx
         Hk = self._H
+
         uH = uk*Hk
 
         model = self.model
@@ -1717,6 +1718,25 @@ class LagrangeMaster(object):
          If Cross-decomposition add cut:
          tk <= zpk* + u*H*y,            forall k
          zpk* is the Benders subproblem objective
+
+    In general, the solution to Lagrangean dual must be converted to a
+    primal feasible solution. Heuristics are commonly used.
+    Can also use cross-decomposition.
+
+    The feasible solution gives a valid upper bound.
+
+    #--------------------------------------------------------
+    # Derivation of supergradient cuts
+    L(x,y,u) = f'y  + c'x  + u'H*y
+    D(u)  = inf L(x,y,u)
+          = inf f'y + c'x + u'H*y
+    D(u)  = L(x^,y^,u)
+         <= L(x0,y0,u)             # Since D(u) is infimum, L at any other u0 greater or equal
+          = f'y0 + c'x0 + u'H*y0
+          = f'y0 + c'x0 + u0'H*y0 + u'H*y0 - u0'H*y0
+          = D(u0) + (H*y0)'(u-u0)
+    Thus, D(u) - D(u0) <= (H*y0)'(u-u0).
+    Therefore, H*y0 is a supergradient of D(.) at u0.
     """
     def __init__(self, cobra_model, solver='gurobi'):
         self.cobra_model = cobra_model
@@ -1741,6 +1761,7 @@ class LagrangeMaster(object):
         self.verbosity = 0
         self.gaptol = 1e-4    # relative gap tolerance
         self.absgaptol = 1e-6    # relative gap tolerance
+        self.feastol = 1e-6
         self.precision_sub = 'gurobi'
         self.print_iter = 10
         self.max_iter = 1000.
@@ -1875,7 +1896,25 @@ class LagrangeMaster(object):
 
         self.model.update()
 
-    def make_supercut(self, sub):
+    def make_supercut(self, sub_dict):
+        """
+        Make supergradient cut for subproblem k:
+
+        z <= sum_k fk'yk + sum_k ck'xk + u*sum_k Hk*yk
+        """
+        z = self._z
+        us = self._us
+        try:
+            fys = [sum(sub._fy*np.array([v.X for v in sub._ys])) for sub in sub_dict.values()]
+            cxs = [sum(sub._cx*np.array([v.X for v in sub._xs])) for sub in sub_dict.values()]
+            yHs = [sub._H*np.array([v.X for v in sub._ys]) for sub in sub_dict.values()]
+            cut = z <= sum(fys) + sum(cxs) + LinExpr(sum(yHs),us)
+        except GurobiError as e:
+            print('Caught GurobiError (%s) in make_supercut()'%repr(e))
+
+        return cut
+
+    def make_multicut(self, sub):
         """
         Make supergradient cut for subproblem k:
 
@@ -1913,13 +1952,18 @@ class LagrangeMaster(object):
 
         return cut
 
-    def optimize(self):
+    def optimize(self, bundle=False, multicut=True):
         """
         Solution procedure
-        1) Solve master for Lagrange multipliers: UB
+        1) Solve master for Lagrange multipliers, u: UB
         2) Update Lagrange multipliers of subproblems
         3) Solve (relaxed) subproblems: LB
         4) if gap = UB-LB < gaptol stop, else goto 1
+
+        If bundle==True, only update uk-->wk+1 if
+        D(wk+1) >= D(uk) + a*(D(wk+1)-D(uk))
+        where a\in (0,1) is an Armijo-like parameter.
+        Else, wk+1 = uk
         """
         model = self.model
         sub_dict = self.sub_dict
@@ -1927,6 +1971,7 @@ class LagrangeMaster(object):
         print_iter = self.print_iter
         gaptol = self.gaptol
         absgaptol = self.absgaptol
+        feastol = self.feastol
         verbosity = self.verbosity
         delta_min = self.delta_min
         delta_mult= self.delta_mult
@@ -1979,13 +2024,19 @@ class LagrangeMaster(object):
                 sub.optimize()
                 sub_objs.append(sub.model.ObjVal)
                 if sub.model.Status == GRB.OPTIMAL:
-                    cut = self.make_supercut(sub)
-                    model.addConstr(cut)
+                    if multicut:
+                        cut = self.make_multicut(sub)
+                        model.addConstr(cut)
 
                 elif sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
                     # If relaxed subproblem is infeasible, original problem was infeasible.
                     raise Exception("Relaxed subproblem is Infeasible or Unbounded. Status=%s (%s)."%(
                         status_dict[sub.model.Status], sub.model.Status))
+
+            if not multicut:
+                cut = self.make_supercut(sub_dict)
+                model.addConstr(cut)
+
             #----------------------------------------------------
             # Update bounds and check convergence
             UB = z.X
@@ -2008,6 +2059,17 @@ class LagrangeMaster(object):
                     _iter,UB,LB,bestLB,gap,relgap*100,delta,toc))
                 print("relgap (%g) <= gaptol (%g). Finished."%(
                     relgap, gaptol))
+                #--------------------------------------------
+                # Final QC that sum_k Hk*yk = 0
+                Hys = []
+                for sub_ind,sub in iteritems(sub_dict):
+                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
+                    Hyk = sub._H*yk
+                    Hys.append(Hyk)
+                print("sum_k Hk*yk: %s"%(sum(Hys)))
+                if sum([abs(x) for x in sum(Hys)]) > feastol:
+                    print("WARNING: Non-anticipativity constraints not satisfied.")
+                #--------------------------------------------
                 break
             elif np.mod(_iter, print_iter)==0:
                 toc = time.time()-tic
