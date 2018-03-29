@@ -1683,16 +1683,32 @@ class LagrangeSubmodel(object):
 
 class LagrangeMaster(object):
     """
+    Given problem
+
+    min  sum_k fk'y + sum_k ck'xk
+    xk,y
+    s.t. Ak*xk + Bk*y [<=>] dk
+         lk <= xk <= uk
+         y integer
+
+    Reformulate for k=1,...,K
+    min  sum_k fk'yk + sum_k ck'xk
+    xk,yk
+    s.t. Ak*xk + Bk*yk [<=>] dk
+         sum_k Hk*yk   =   0
+         lk <= xk <= uk
+         yk integer
+
     Lagrangean (dual) master problem:
 
-    max  z + delta/2 ||u - u*||2
+    max  z - delta/2 ||u - u*||2
     u,z,tk
     s.t  z  <= sum_k wk*tk
-         tk <= f'yk + c'xk + u*Hk*yk,    forall k
-         tk <= zpk* + u*H*y,            forall k
+         tk <= fk'yk + c'xk + u*Hk*yk,    forall k=1,..,K
 
-    Cross-decomposition:
-    zpk* is the Benders subproblem objective
+         If Cross-decomposition add cut:
+         tk <= zpk* + u*H*y,            forall k
+         zpk* is the Benders subproblem objective
     """
     def __init__(self, cobra_model, solver='gurobi'):
         self.cobra_model = cobra_model
@@ -1712,6 +1728,7 @@ class LagrangeMaster(object):
         self._mets_d = mets_d
         self._mets_b = mets_b
         self._us = None # Initialized with add_submodels
+        self._z = None
         self._INF = 1e3
         self.verbosity = 0
         self.gaptol = 1e-4    # relative gap tolerance
@@ -1906,10 +1923,6 @@ class LagrangeMaster(object):
             'Iter','UB','LB','Best UB','Best LB','gap','relgap(%)','time(s)'))
 
         for _iter in range(max_iter):
-            if np.mod(_iter, print_iter)==0:
-                toc = time.time()-tic
-                print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
-                    _iter,UB,LB,UB,bestLB,gap,relgap*100,toc))
             #----------------------------------------------------
             # Solve Master
             model.optimize()
@@ -1944,10 +1957,14 @@ class LagrangeMaster(object):
             relgap = gap/(1e-10+abs(UB))
             if relgap <= gaptol:
                 toc = time.time()-tic
-                print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
                     _iter,UB,LB,UB,bestLB,gap,relgap*100,toc))
                 print("relgap (%g) <= gaptol (%g). Finished.")
                 break
+            elif np.mod(_iter, print_iter)==0:
+                toc = time.time()-tic
+                print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
+                    _iter,UB,LB,UB,bestLB,gap,relgap*100,toc))
 
         x_dict = {v.VarName:v.X for v in model.getVars()}
         self.x_dict = x_dict
