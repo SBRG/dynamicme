@@ -1554,7 +1554,7 @@ class LagrangeSubmodel(object):
     """
     Lagrangean (dual) subproblem
 
-    min  f'yk + c'xk + uk'*Hk*yk
+    min  f'yk + c'xk + u'*Hk*yk
     xk,yk
     s.t. Axk + Byk [<=>] d
                Cyk [<=>] b
@@ -1699,12 +1699,20 @@ class LagrangeMaster(object):
          lk <= xk <= uk
          yk integer
 
+    Lagrange relaxation
+    min  sum_k fk'yk + sum_k ck'xk + sum_k u*Hk*yk
+       = sum_k (fk'yk + ck'xk + u*Hk*yk)
+    xk,yk
+    s.t. Ak*xk + Bk*yk [<=>] dk
+         lk <= xk <= uk
+         yk integer
+
     Lagrangean (dual) master problem:
 
     max  z - delta/2 ||u - u*||2
     u,z,tk
     s.t  z  <= sum_k wk*tk
-         tk <= fk'yk + c'xk + u*Hk*yk,    forall k=1,..,K
+         tk <= fk'yk + c'xk + u*Hk*yk,    forall k=1,..,K   (supergradient cut)
 
          If Cross-decomposition add cut:
          tk <= zpk* + u*H*y,            forall k
@@ -1736,6 +1744,8 @@ class LagrangeMaster(object):
         self.precision_sub = 'gurobi'
         self.print_iter = 10
         self.max_iter = 1000.
+        self.delta_min = 1e-10
+        self.delta_mult = 0.5
         self.x_dict = {}
 
         self.model = self.init_model(ys)
@@ -1755,7 +1765,7 @@ class LagrangeMaster(object):
 
         return model
 
-    def update_obj(self, delta=1, u0=None):
+    def update_obj(self, delta=1., u0=None):
         """
         #----------------------------------------------------
         # max  z - delta/2 ||u - u0||2
@@ -1802,19 +1812,33 @@ class LagrangeMaster(object):
             self.model.chgCoeff(zcut, tk, -wk)
 
         # Update non-anticipativity constraints using ALL submodels
+        # E.g., H0 = 
+        # [[1 0 0]
+        #  [0 1 0]
+        #  [0 0 1]
+        #  [0 0 0]
+        #  [0 0 0]
+        #  [0 0 0]]
+        # E.g., H1 = 
+        # [[-1  0  0]
+        #  [ 0 -1  0]
+        #  [ 0  0 -1]
+        #  [ 1  0  0]
+        #  [ 0  1  0]
+        #  [ 0  0  1]]
         nsub = len(self.sub_dict.keys())
         ny = len(self._y0)
         # Update us
         INF = self._INF
         us = []
-        for j in range(ny):
-            for k in range(nsub-1):
-                vid = 'u_%d%d'%(j,k)
-                ujk = self.model.getVarByName(vid)
-                if ujk is None:
+        for k in range(nsub-1):
+            for j in range(ny):
+                vid = 'u_%d%d'%(k,j)
+                ukj = self.model.getVarByName(vid)
+                if ukj is None:
                     # Multiplier for an equality constraint
-                    ujk = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,vid)
-                us.append(ujk)
+                    ukj = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,vid)
+                us.append(ukj)
 
         self._us = us
 
@@ -1904,6 +1928,9 @@ class LagrangeMaster(object):
         gaptol = self.gaptol
         absgaptol = self.absgaptol
         verbosity = self.verbosity
+        delta_min = self.delta_min
+        delta_mult= self.delta_mult
+        delta = 1.
 
         z = self._z
         us = self._us
@@ -1916,20 +1943,33 @@ class LagrangeMaster(object):
         gap = UB-bestLB
         relgap = gap/(1e-10+abs(UB))
         uk = np.zeros(nu)
+        u0 = np.zeros(nu)   # Trust region center
         ubest = uk
+        x_dict = {}
+
+        status_dict[GRB.SUBOPTIMAL] = 'suboptimal'
+        status_dict[GRB.NUMERIC] = 'numeric'
 
         tic = time.time()
-        print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
-            'Iter','UB','LB','Best UB','Best LB','gap','relgap(%)','time(s)'))
+        print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s%12.8s" % (
+            'Iter','UB','LB','Best Bnd','gap','relgap(%)','delta','time(s)'))
 
         for _iter in range(max_iter):
             #----------------------------------------------------
             # Solve Master
             model.optimize()
-            if model.Status == GRB.OPTIMAL:
+            #if model.Status in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
+            if model.SolCount > 0:
                 uk = np.array([u.X for u in self._us])
+                if model.Status != GRB.OPTIMAL:
+                    warnings.warn("Solution available but Master solver status=%s (%s)."%(
+                        status_dict[model.Status], model.Status))
+                    if verbosity>1:
+                        print("Master solver status=%s (%s)."%(
+                            status_dict[model.Status], model.Status))
             else:
-                raise Exception("Solver status=%s. Aborting."%model.Status)
+                raise Exception("Master solver status=%s (%s). Aborting."%(
+                    status_dict[model.Status], model.Status))
 
             #----------------------------------------------------
             # Solve Subproblems
@@ -1944,30 +1984,58 @@ class LagrangeMaster(object):
 
                 elif sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
                     # If relaxed subproblem is infeasible, original problem was infeasible.
-                    raise Exception("Relaxed subproblem is Infeasible or Unbounded. Status=%s."%(
-                        sub.model.Status))
+                    raise Exception("Relaxed subproblem is Infeasible or Unbounded. Status=%s (%s)."%(
+                        status_dict[sub.model.Status], sub.model.Status))
             #----------------------------------------------------
-            # Update bounds
+            # Update bounds and check convergence
             UB = z.X
             LB = sum(sub_objs)
             if LB > bestLB:
                 bestLB = LB
                 ubest  = uk
+                # Save best master solution
+                self.x_dict = {v.VarName:v.X for v in model.getVars()}
+                self.uopt = ubest
+                # Also keep the best submodel solutions
+                for sub in sub_dict.values():
+                    sub.x_dict = {x.VarName:x.X for x in sub.model.getVars()}
+
             gap = UB-bestLB
             relgap = gap/(1e-10+abs(UB))
             if relgap <= gaptol:
                 toc = time.time()-tic
                 print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                    _iter,UB,LB,UB,bestLB,gap,relgap*100,toc))
-                print("relgap (%g) <= gaptol (%g). Finished.")
+                    _iter,UB,LB,bestLB,gap,relgap*100,delta,toc))
+                print("relgap (%g) <= gaptol (%g). Finished."%(
+                    relgap, gaptol))
                 break
             elif np.mod(_iter, print_iter)==0:
                 toc = time.time()-tic
                 print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                    _iter,UB,LB,UB,bestLB,gap,relgap*100,toc))
+                    _iter,UB,LB,bestLB,gap,relgap*100,delta,toc))
 
-        x_dict = {v.VarName:v.X for v in model.getVars()}
-        self.x_dict = x_dict
-        self.uopt = ubest
+            #----------------------------------------------------
+            # Update delta in objective according to trust region update rule
+            delta = max(delta_min, delta_mult*delta)
+            self.update_obj(delta, u0)
 
-        return ubest
+        return x_dict
+
+    def solve_relaxed(self):
+        """
+        Solve LP relaxation.
+        """
+        model = self.model
+        sub_dict = self.sub_dict
+        ytype_dict = {sub_ind:[y.VType for y in sub._ys] for sub_ind,sub in iteritems(sub_dict)}
+        for sub in sub_dict.values():
+            for y in sub._ys:
+                y.VType = GRB.CONTINUOUS
+        x_dict = self.optimize()
+
+        # Make integer/binary again
+        for sub_ind,sub in iteritems(sub_dict):
+            for y,yt in zip(sub._ys,ytype_dict[sub_ind]):
+                y.VType = yt
+
+        return x_dict
