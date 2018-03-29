@@ -1660,19 +1660,23 @@ class LagrangeSubmodel(object):
         model.setObjective(obj_fun, GRB.MINIMIZE)
         model.update()
 
-    def optimize(self, xk, yk):
+    def optimize(self, xk=None, yk=None):
         """
-        Solve with warm-start
+        Solve with warm-start.
+        Some solvers do this automatically.
         """
         model = self.model
         xs = self._xs
         ys = self._ys
 
-        for x,xopt in zip(xs,xk):
-            x.Start = xopt
+        if xk is not None:
+            # Start only used for integer/binary variables no?
+            for x,xopt in zip(xs,xk):
+                x.Start = xopt
 
-        for y,yopt in zip(ys,yk):
-            y.Start = yopt
+        if yk is not None:
+            for y,yopt in zip(ys,yk):
+                y.Start = yopt
 
         model.optimize()
 
@@ -1707,7 +1711,15 @@ class LagrangeMaster(object):
         self._y0 = ys
         self._mets_d = mets_d
         self._mets_b = mets_b
+        self._us = None # Initialized with add_submodels
         self._INF = 1e3
+        self.verbosity = 0
+        self.gaptol = 1e-4    # relative gap tolerance
+        self.absgaptol = 1e-6    # relative gap tolerance
+        self.precision_sub = 'gurobi'
+        self.print_iter = 10
+        self.max_iter = 1000.
+        self.x_dict = {}
 
         self.model = self.init_model(ys)
 
@@ -1721,6 +1733,7 @@ class LagrangeMaster(object):
         # z  <= sum_k wk*sk
         model.addConstr(z, GRB.LESS_EQUAL, 0., 'z_cut')
         self.model = model
+        model.Params.OutputFlag = 0
         model.update()
 
         return model
@@ -1821,23 +1834,28 @@ class LagrangeMaster(object):
 
         self.model.update()
 
-    def make_optcut(self, sub, xk, yk):
+    def make_supercut(self, sub):
         """
-        tk <= f'yk + c'xk + u*Hk*yk,    forall k
+        Make supergradient cut for subproblem k:
+
+        tk <= f'yk + c'xk + u*Hk*yk
         Hk = [ny*(K-1) x ny] matrix
         """
         tk  = self.model.getVarByName('tk_%s'%sub._id)
         fy  = sub._fy
         cx  = sub._cx
         Hk  = sub._H
+        xk = np.array([v.X for v in sub._xs])
+        yk = np.array([v.X for v in sub._ys])
+
         yH  = Hk*yk
         us  = self._us
         try:
-            optcut = tk <= sum(fy*yk) + sum(cx*xk) + LinExpr(yH,us)
+            cut = tk <= sum(fy*yk) + sum(cx*xk) + LinExpr(yH,us)
         except GurobiError as e:
-            print('Caught GurobiError (%s) in make_optcut()'%repr(e))
+            print('Caught GurobiError (%s) in make_supercut()'%repr(e))
 
-        return optcut
+        return cut
 
     def make_benderscut(self, sub, zpk, yopt):
         """
@@ -1853,3 +1871,86 @@ class LagrangeMaster(object):
             print('Caught GurobiError (%s) in make_benderscut()'%repr(e))
 
         return cut
+
+    def optimize(self):
+        """
+        Solution procedure
+        1) Solve master for Lagrange multipliers: UB
+        2) Update Lagrange multipliers of subproblems
+        3) Solve (relaxed) subproblems: LB
+        4) if gap = UB-LB < gaptol stop, else goto 1
+        """
+        model = self.model
+        sub_dict = self.sub_dict
+        max_iter = self.max_iter
+        print_iter = self.print_iter
+        gaptol = self.gaptol
+        absgaptol = self.absgaptol
+        verbosity = self.verbosity
+
+        z = self._z
+        us = self._us
+        nu = len(us)
+
+        UB = 1e100      # Overestimator from master, with supergradient-based polyhedral approx
+                        # Should decrease monotonically
+        LB = -1e100     # Underestimator from dual relaxed subproblems
+        bestLB = LB
+        gap = UB-bestLB
+        relgap = gap/(1e-10+abs(UB))
+        uk = np.zeros(nu)
+        ubest = uk
+
+        tic = time.time()
+        print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+            'Iter','UB','LB','Best UB','Best LB','gap','relgap(%)','time(s)'))
+
+        for _iter in range(max_iter):
+            if np.mod(_iter, print_iter)==0:
+                toc = time.time()-tic
+                print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                    _iter,UB,LB,UB,bestLB,gap,relgap*100,toc))
+            #----------------------------------------------------
+            # Solve Master
+            model.optimize()
+            if model.Status == GRB.OPTIMAL:
+                uk = np.array([u.X for u in self._us])
+            else:
+                raise Exception("Solver status=%s. Aborting."%model.Status)
+
+            #----------------------------------------------------
+            # Solve Subproblems
+            sub_objs = []
+            for sub_ind,sub in iteritems(sub_dict):
+                sub.update_obj(uk)
+                sub.optimize()
+                sub_objs.append(sub.model.ObjVal)
+                if sub.model.Status == GRB.OPTIMAL:
+                    cut = self.make_supercut(sub)
+                    model.addConstr(cut)
+
+                elif sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+                    # If relaxed subproblem is infeasible, original problem was infeasible.
+                    raise Exception("Relaxed subproblem is Infeasible or Unbounded. Status=%s."%(
+                        sub.model.Status))
+            #----------------------------------------------------
+            # Update bounds
+            UB = z.X
+            LB = sum(sub_objs)
+            if LB > bestLB:
+                bestLB = LB
+                ubest  = uk
+            gap = UB-bestLB
+            relgap = gap/(1e-10+abs(UB))
+            if relgap <= gaptol:
+                toc = time.time()-tic
+                print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s" % (
+                    _iter,UB,LB,UB,bestLB,gap,relgap*100,toc))
+                print("relgap (%g) <= gaptol (%g). Finished.")
+                break
+
+        x_dict = {v.VarName:v.X for v in model.getVars()}
+        self.x_dict = x_dict
+        self.uopt = ubest
+
+        return ubest
