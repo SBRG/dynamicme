@@ -13,7 +13,7 @@
 from __future__ import division
 from six import iteritems
 from builtins import range
-from scipy.sparse import coo_matrix, csr_matrix, csc_matrix
+from scipy.sparse import coo_matrix, csr_matrix, csc_matrix, identity
 from cobra.core import Solution
 from cobra import Reaction, Metabolite, Model
 from cobra import DictList
@@ -1694,18 +1694,21 @@ class LagrangeMaster(object):
 
     Reformulate for k=1,...,K
     min  sum_k fk'yk + sum_k ck'xk
-    xk,yk
+    xk,yk,y0
     s.t. Ak*xk + Bk*yk [<=>] dk
-         sum_k Hk*yk   =   0
+         yk - y0 = 0,    k=1,..,K
          lk <= xk <= uk
          yk integer
 
     Lagrange relaxation
-    min  sum_k fk'yk + sum_k ck'xk + sum_k u*Hk*yk
-       = sum_k (fk'yk + ck'xk + u*Hk*yk)
-    xk,yk
+    min  sum_k fk'yk + sum_k ck'xk + sum_k uk'*(yk-y0)
+       = sum_k (fk'yk + ck'xk + uk*yk) - sum_k uk*y0
+       = sum_k (fk'yk + ck'xk + uk*yk)   (since sum_k uk = 0)
+       = sum_k (fk'yk + ck'xk + uk*Hk*yk) -sum_k uk*Hk*y0  (where Hk=[...,0 Ik 0, ...])
+    xk,yk,y0
     s.t. Ak*xk + Bk*yk [<=>] dk
          lk <= xk <= uk
+         sum_k uk = 0
          yk integer
 
     Lagrangean (dual) master problem:
@@ -1713,10 +1716,11 @@ class LagrangeMaster(object):
     max  z - delta/2 ||u - u*||2
     u,z,tk
     s.t  z  <= sum_k wk*tk
-         tk <= fk'yk + c'xk + u*Hk*yk,    forall k=1,..,K   (supergradient cut)
+         tk <= fk'yk + c'xk + uk*Hk*yk - uk*Hk*y0,    forall k=1,..,K   (supergradient cut)
+         sum_k uk = 0
 
          If Cross-decomposition add cut:
-         tk <= zpk* + u*H*y,            forall k
+         tk <= zpk* + u*Hk*y,            forall k
          zpk* is the Benders subproblem objective
 
     In general, the solution to Lagrangean dual must be converted to a
@@ -1741,6 +1745,7 @@ class LagrangeMaster(object):
     def __init__(self, cobra_model, solver='gurobi'):
         self.cobra_model = cobra_model
         self.sub_dict = {}
+        self.primal_dict={}
         A,B,d,csenses,xs,ys,C,b,csenses_mp,mets_d,mets_b = split_cobra(cobra_model)
         self._A = A
         self._Acsc = A.tocsc()
@@ -1811,86 +1816,116 @@ class LagrangeMaster(object):
 
         return obj_fun
 
-    def add_submodels(self, sub_dict):
+    def add_submodels(self, sub_dict, antic_method='asymmetric'):
         """
         Add submodels.
         Inputs
         sub_dict : dict of LagrangeSubmodel objects
+        antic_method : nonanticipativity constraint method
+            'extra': xk-x = 0
+            'stagger': x1=x2, ... xk-1=xk
+            'asymmetric':x1=x2, x1=x3, ..., x1=xk   # Reported to be the best (Oliveira, 2013)
         """
         INF = self._INF
-        zcut = self.model.getConstrByName('z_cut')
+        model = self.model
+        zcut = model.getConstrByName('z_cut')
         for sub_ind,sub in iteritems(sub_dict):
             self.sub_dict[sub_ind] = sub
             # Also update tk variables and constraints
             tk_id = 'tk_%s'%sub_ind
-            tk = self.model.getVarByName(tk_id)
+            tk = model.getVarByName(tk_id)
             if tk is None:
-                tk = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,tk_id)
+                tk = model.addVar(-INF,INF,0.,GRB.CONTINUOUS,tk_id)
             # Update cut
             # z <= sum_k wk*tk
             # z - sum_k wk*tk <= 0
             wk = sub._weight
-            self.model.chgCoeff(zcut, tk, -wk)
+            model.chgCoeff(zcut, tk, -wk)
 
         # Update non-anticipativity constraints using ALL submodels
-        # E.g., H0 = 
-        # [[1 0 0]
-        #  [0 1 0]
-        #  [0 0 1]
-        #  [0 0 0]
-        #  [0 0 0]
-        #  [0 0 0]]
-        # E.g., H1 = 
-        # [[-1  0  0]
-        #  [ 0 -1  0]
-        #  [ 0  0 -1]
-        #  [ 1  0  0]
-        #  [ 0  1  0]
-        #  [ 0  0  1]]
         nsub = len(self.sub_dict.keys())
         ny = len(self._y0)
         # Update us
         INF = self._INF
         us = []
-        for k in range(nsub-1):
+        nsub_max = nsub
+        if antic_method in ['stagger','asymmetric']:
+            nsub_max=nsub-1
+
+        for k in range(nsub_max):
             for j in range(ny):
                 vid = 'u_%d%d'%(k,j)
-                ukj = self.model.getVarByName(vid)
+                ukj = model.getVarByName(vid)
                 if ukj is None:
                     # Multiplier for an equality constraint
-                    ukj = self.model.addVar(-INF,INF,0.,GRB.CONTINUOUS,vid)
+                    ukj = model.addVar(-INF,INF,0.,GRB.CONTINUOUS,vid)
                 us.append(ukj)
 
         self._us = us
+        # sum_u = 0 constraint
+        uzero = model.getConstrByName('uzero')
+        if uzero is None:
+            uzero = model.addConstr(
+                    LinExpr(np.ones(len(us)),us) == 0, name='uzero')
+        else:
+            uzero.RHS = 0.
+            uzero.Sense = GRB.EQUAL
+            for u in us:
+                model.chgCoeff(uzero, u, 1.)
 
         # Each submodel's Hk: [ny*(K-1) x ny] matrix
-        Hm = ny*(nsub-1)
+        Hm = ny*nsub_max
         Hn = ny
-        for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
-            if k < nsub-1:
-                # Last set doesn't need self
-                data_self = np.ones(ny).tolist()
-                rows_self = np.arange(k*ny,(k+1)*ny).tolist() #range(ny) + k*ny
-                cols_self = list(range(ny))
-            else:
-                data_self = []
-                rows_self = []
-                cols_self = []
-            if k > 0:
-                data_other= (-np.ones(ny)).tolist()
-                rows_other= np.arange((k-1)*ny,k*ny).tolist() #range(ny) + (k-1)*ny
-                cols_other= list(range(ny))
-            else:
-                data_other= []
-                rows_other= []
-                cols_other= []
+        if antic_method=='extra':
+            # Just identity matrix
+            for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+                data = np.ones(ny)
+                rows = np.arange(k*ny,(k+1)*ny)
+                cols = range(ny)
+                Hk = coo_matrix((data,(rows,cols)), shape=(Hm,Hn)).tocsr()
+                sub._H = Hk
 
-            data = data_self + data_other
-            rows = rows_self + rows_other
-            cols = cols_self + cols_other
+        elif antic_method=='stagger':
+            for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+                if k < nsub-1:
+                    # Last set doesn't need self
+                    data_self = np.ones(ny).tolist()
+                    rows_self = np.arange(k*ny,(k+1)*ny).tolist() #range(ny) + k*ny
+                    cols_self = list(range(ny))
+                else:
+                    data_self = []
+                    rows_self = []
+                    cols_self = []
+                if k > 0:
+                    data_other= (-np.ones(ny)).tolist()
+                    rows_other= np.arange((k-1)*ny,k*ny).tolist() #range(ny) + (k-1)*ny
+                    cols_other= list(range(ny))
+                else:
+                    data_other= []
+                    rows_other= []
+                    cols_other= []
 
-            Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
-            sub._H = Hk
+                data = data_self + data_other
+                rows = rows_self + rows_other
+                cols = cols_self + cols_other
+
+                Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
+                sub._H = Hk
+
+        elif antic_method=='asymmetric':
+            for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+                if k==0:
+                    data = np.ones(ny*nsub_max)
+                    rows = range(ny*nsub_max)
+                    cols = [ii for i in [range(ny) for kk in range(nsub_max)] for ii in i]
+                else:
+                    data= -np.ones(ny)
+                    rows= np.arange((k-1)*ny,k*ny)
+                    cols= range(ny)
+
+                Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
+                sub._H = Hk
+
 
         self.update_obj()
 
@@ -1952,18 +1987,27 @@ class LagrangeMaster(object):
 
         return cut
 
-    def optimize(self, bundle=False, multicut=True):
+    def optimize(self, feasible_method='heuristic', bundle=False, multicut=True):
         """
         Solution procedure
-        1) Solve master for Lagrange multipliers, u: UB
-        2) Update Lagrange multipliers of subproblems
-        3) Solve (relaxed) subproblems: LB
-        4) if gap = UB-LB < gaptol stop, else goto 1
+        Init Lagrange multipliers, u
+        1) Update u in Lagrange relaxed subproblems
+        2) Solve relaxed subproblems: LB
+        3) Construct feasible solution for complicating variables
+        4) Solve primal subproblems using feasible solution: UB
+        5) if gap = UB-LB < gaptol stop, else continue
+        6) Solve Lagrange dual problem: u(k+1). Goto 1)
 
-        If bundle==True, only update uk-->wk+1 if
-        D(wk+1) >= D(uk) + a*(D(wk+1)-D(uk))
-        where a\in (0,1) is an Armijo-like parameter.
-        Else, wk+1 = uk
+        Inputs
+        feasible_method : method to construct feasible solution
+                          for complicating (integer) variables.
+                          - heuristic (default) : use heuristic
+                          - benders : Benders' decomposition, making overall
+                            procedure a cross-decomposition.
+        bundle : if True, only update uk-->wk+1 if
+                            D(wk+1) >= D(uk) + a*(D(wk+1)-D(uk))
+                            where a\in (0,1) is an Armijo-like parameter.
+                            Else, wk+1 = uk
         """
         model = self.model
         sub_dict = self.sub_dict
@@ -1981,11 +2025,14 @@ class LagrangeMaster(object):
         us = self._us
         nu = len(us)
 
-        UB = 1e100      # Overestimator from master, with supergradient-based polyhedral approx
+        dualUB = 1e100# Overestimator from master, with supergradient-based polyhedral approx
                         # Should decrease monotonically
+        UB = 1e100      # UB from feasible solution. Not necessarily monotonic, depending
+                        # method used to construct feasible solution.
         LB = -1e100     # Underestimator from dual relaxed subproblems
         bestLB = LB
-        gap = UB-bestLB
+        bestUB = UB     # Given by best feasible solution, not the master problem
+        gap = bestUB-bestLB
         relgap = gap/(1e-10+abs(UB))
         uk = np.zeros(nu)
         u0 = np.zeros(nu)   # Trust region center
@@ -1997,7 +2044,7 @@ class LagrangeMaster(object):
 
         tic = time.time()
         print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s%12.8s" % (
-            'Iter','UB','LB','Best Bnd','gap','relgap(%)','delta','time(s)'))
+            'Iter','Dual UB','Feas UB','Best LB','gap','relgap(%)','delta','time(s)'))
 
         for _iter in range(max_iter):
             #----------------------------------------------------
@@ -2038,8 +2085,24 @@ class LagrangeMaster(object):
                 model.addConstr(cut)
 
             #----------------------------------------------------
-            # Update bounds and check convergence
+            # Construct feasible solution
+            if feasible_method=='heuristic':
+                pass
+            elif feasible_method=='benders':
+                pass
+
+            # Compute UB
+            # for sub_ind,primal in iteritems(primal_dict):
+            #     pass
+            #************************************************
+            # DEBUG TODO
             UB = z.X
+            #************************************************
+
+
+            #----------------------------------------------------
+            # Update bounds and check convergence
+            dualUB = z.X
             LB = sum(sub_objs)
             if LB > bestLB:
                 bestLB = LB
@@ -2056,7 +2119,7 @@ class LagrangeMaster(object):
             if relgap <= gaptol:
                 toc = time.time()-tic
                 print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                    _iter,UB,LB,bestLB,gap,relgap*100,delta,toc))
+                    _iter,dualUB,bestUB,bestLB,gap,relgap*100,delta,toc))
                 print("relgap (%g) <= gaptol (%g). Finished."%(
                     relgap, gaptol))
                 #--------------------------------------------
@@ -2074,7 +2137,7 @@ class LagrangeMaster(object):
             elif np.mod(_iter, print_iter)==0:
                 toc = time.time()-tic
                 print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                    _iter,UB,LB,bestLB,gap,relgap*100,delta,toc))
+                    _iter,dualUB,bestUB,bestLB,gap,relgap*100,delta,toc))
 
             #----------------------------------------------------
             # Update delta in objective according to trust region update rule
