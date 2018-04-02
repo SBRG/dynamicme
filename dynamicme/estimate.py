@@ -62,6 +62,7 @@ class RadixEstimator(Estimator):
         self.digits = None
         self.kfit_dict = None
         self.col_ind = None
+        self.stacker = None
 
 
     def fit(self, base_model, df_X, df_Y, **kwargs):

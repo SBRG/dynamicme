@@ -1564,6 +1564,8 @@ class LagrangeSubmodel(object):
     and Hk constrain yk to be the same across all subproblems.
     """
     def __init__(self, cobra_model, _id, solver='gurobi', weight=1.):
+        """
+        """
         self._id = _id
         self.cobra_model = cobra_model
         self._weight = weight
@@ -1582,6 +1584,9 @@ class LagrangeSubmodel(object):
         self._mets_d = mets_d
         self._mets_b = mets_b
         self._H = None
+        self.yopt = None
+        self.x_dict={}
+        self.ObjVal = None
 
         # self.model = self.init_model(xs, A, d, csenses)
         self.model = self.init_model()
@@ -1681,6 +1686,16 @@ class LagrangeSubmodel(object):
 
         model.optimize()
 
+        if model.SolCount>0:
+            objval = model.ObjVal
+            self.yopt = np.array([y.X for y in ys])
+            self.x_dict = {v.VarName:v.X for v in model.getVars()}
+            self.ObjVal = objval
+        else:
+            objval = np.nan
+
+        return objval
+
 
 class LagrangeMaster(object):
     """
@@ -1694,18 +1709,15 @@ class LagrangeMaster(object):
 
     Reformulate for k=1,...,K
     min  sum_k fk'yk + sum_k ck'xk
-    xk,yk,y0
+    xk,yk
     s.t. Ak*xk + Bk*yk [<=>] dk
-         yk - y0 = 0,    k=1,..,K
+         yk - y1 = 0,    k=2,..,K   (asymmetric non-anticipativity constraints)
          lk <= xk <= uk
          yk integer
 
     Lagrange relaxation
-    min  sum_k fk'yk + sum_k ck'xk + sum_k uk'*(yk-y0)
-       = sum_k (fk'yk + ck'xk + uk*yk) - sum_k uk*y0
-       = sum_k (fk'yk + ck'xk + uk*yk)   (since sum_k uk = 0)
-       = sum_k (fk'yk + ck'xk + uk*Hk*yk) -sum_k uk*Hk*y0  (where Hk=[...,0 Ik 0, ...])
-    xk,yk,y0
+    min  sum_k fk'yk + sum_k ck'xk + sum_k uk'*Hk*yk
+    xk,yk
     s.t. Ak*xk + Bk*yk [<=>] dk
          lk <= xk <= uk
          sum_k uk = 0
@@ -1716,7 +1728,7 @@ class LagrangeMaster(object):
     max  z - delta/2 ||u - u*||2
     u,z,tk
     s.t  z  <= sum_k wk*tk
-         tk <= fk'yk + c'xk + uk*Hk*yk - uk*Hk*y0,    forall k=1,..,K   (supergradient cut)
+         tk <= fk'yk + c'xk + uk*Hk*yk,    forall k=1,..,K   (supergradient cut)
          sum_k uk = 0
 
          If Cross-decomposition add cut:
@@ -1726,6 +1738,9 @@ class LagrangeMaster(object):
     In general, the solution to Lagrangean dual must be converted to a
     primal feasible solution. Heuristics are commonly used.
     Can also use cross-decomposition.
+
+    If candidate feasible solution is infeasible, add integer cut to 
+    exclude it from all subproblems.
 
     The feasible solution gives a valid upper bound.
 
@@ -1742,7 +1757,11 @@ class LagrangeMaster(object):
     Thus, D(u) - D(u0) <= (H*y0)'(u-u0).
     Therefore, H*y0 is a supergradient of D(.) at u0.
     """
-    def __init__(self, cobra_model, solver='gurobi'):
+    def __init__(self, cobra_model, solver='gurobi', method='ld'):
+        """
+        Input
+        method : 'lr' Lagrangean relaxation, 'ld' Lagrangean decomposition
+        """
         self.cobra_model = cobra_model
         self.sub_dict = {}
         self.primal_dict={}
@@ -1936,13 +1955,18 @@ class LagrangeMaster(object):
         Make supergradient cut for subproblem k:
 
         z <= sum_k fk'yk + sum_k ck'xk + u*sum_k Hk*yk
+
+        Use stored solution for best LB
         """
         z = self._z
         us = self._us
         try:
-            fys = [sum(sub._fy*np.array([v.X for v in sub._ys])) for sub in sub_dict.values()]
-            cxs = [sum(sub._cx*np.array([v.X for v in sub._xs])) for sub in sub_dict.values()]
-            yHs = [sub._H*np.array([v.X for v in sub._ys]) for sub in sub_dict.values()]
+            fys = [sum(sub._fy*np.array([sub.x_dict[v.VarName] for v in sub._ys]))
+                    for sub in sub_dict.values()]
+            cxs = [sum(sub._cx*np.array([sub.x_dict[v.VarName] for v in sub._xs]))
+                    for sub in sub_dict.values()]
+            yHs = [sub._H*np.array([sub.x_dict[v.VarName] for v in sub._ys])
+                    for sub in sub_dict.values()]
             cut = z <= sum(fys) + sum(cxs) + LinExpr(sum(yHs),us)
         except GurobiError as e:
             print('Caught GurobiError (%s) in make_supercut()'%repr(e))
@@ -1960,8 +1984,8 @@ class LagrangeMaster(object):
         fy  = sub._fy
         cx  = sub._cx
         Hk  = sub._H
-        xk = np.array([v.X for v in sub._xs])
-        yk = np.array([v.X for v in sub._ys])
+        xk = np.array([sub.x_dict[v.VarName] for v in sub._xs])
+        yk = np.array([sub.x_dict[v.VarName] for v in sub._ys])
 
         yH  = Hk*yk
         us  = self._us
@@ -1989,6 +2013,8 @@ class LagrangeMaster(object):
 
     def optimize(self, feasible_method='heuristic', bundle=False, multicut=True):
         """
+        x_dict = optimize()
+
         Solution procedure
         Init Lagrange multipliers, u
         1) Update u in Lagrange relaxed subproblems
@@ -2008,6 +2034,9 @@ class LagrangeMaster(object):
                             D(wk+1) >= D(uk) + a*(D(wk+1)-D(uk))
                             where a\in (0,1) is an Armijo-like parameter.
                             Else, wk+1 = uk
+
+        Outputs
+        x_dict : {x.VarName:x.X}
         """
         model = self.model
         sub_dict = self.sub_dict
@@ -2044,11 +2073,13 @@ class LagrangeMaster(object):
 
         tic = time.time()
         print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s%12.8s" % (
-            'Iter','Dual UB','Feas UB','Best LB','gap','relgap(%)','delta','time(s)'))
+            'Iter','Dual UB','LB','Best LB','gap','relgap(%)','delta','time(s)'))
 
         for _iter in range(max_iter):
             #----------------------------------------------------
             # Solve Master
+            #----------------------------------------------------
+            self.update_obj(delta, u0)
             model.optimize()
             #if model.Status in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
             if model.SolCount > 0:
@@ -2065,11 +2096,12 @@ class LagrangeMaster(object):
 
             #----------------------------------------------------
             # Solve Subproblems
+            #----------------------------------------------------
             sub_objs = []
             for sub_ind,sub in iteritems(sub_dict):
                 sub.update_obj(uk)
-                sub.optimize()
-                sub_objs.append(sub.model.ObjVal)
+                obj = sub.optimize()
+                sub_objs.append(obj)
                 if sub.model.Status == GRB.OPTIMAL:
                     if multicut:
                         cut = self.make_multicut(sub)
@@ -2085,20 +2117,37 @@ class LagrangeMaster(object):
                 model.addConstr(cut)
 
             #----------------------------------------------------
-            # Construct feasible solution
-            if feasible_method=='heuristic':
-                pass
-            elif feasible_method=='benders':
-                pass
-
             # Compute UB
-            # for sub_ind,primal in iteritems(primal_dict):
-            #     pass
-            #************************************************
-            # DEBUG TODO
             UB = z.X
-            #************************************************
+            # Compute UB from feasible 
+            # y0 = self.make_feasible()
+            # y0 = sub_dict[sub_dict.keys()[0]].yopt
+            # sub_stats, obj_dict = self.check_feasible(y0)
+            # subobj_dict = {}
+            # for sub_ind,sub in iteritems(sub_dict):
+            #     y0 = np.array([v.X for v in sub._ys])
+            #     y0 = sub.yopt
+            #     sub_stats, obj_dict = self.check_feasible(y0)
+            #     subobj_dict[sub_ind] = sum(obj_dict.values())
 
+            # minobj = min(subobj_dict.values())
+            # feasUB = minobj
+            # for sub_ind,sub in iteritems(sub_dict):
+            #     if subobj_dict[sub_ind]==minobj:
+            #         y0 = sub.yopt
+
+            # feasUB = sum(obj_dict.values())
+
+            y0 = sub_dict[sub_dict.keys()[0]].yopt
+            feasUB = UB
+
+            if feasUB < bestUB:
+                bestUB = feasUB
+                ybest = y0
+                for j,yj in enumerate(y0):
+                    x_dict[sub._ys[j].VarName] = yj
+                ubest  = uk
+                self.uopt = ubest
 
             #----------------------------------------------------
             # Update bounds and check convergence
@@ -2111,15 +2160,15 @@ class LagrangeMaster(object):
                 self.x_dict = {v.VarName:v.X for v in model.getVars()}
                 self.uopt = ubest
                 # Also keep the best submodel solutions
-                for sub in sub_dict.values():
-                    sub.x_dict = {x.VarName:x.X for x in sub.model.getVars()}
+                # for sub in sub_dict.values():
+                #     sub.x_dict = {x.VarName:x.X for x in sub.model.getVars()}
 
-            gap = UB-bestLB
-            relgap = gap/(1e-10+abs(UB))
+            gap = bestUB-bestLB
+            relgap = gap/(1e-10+abs(bestUB))
             if relgap <= gaptol:
                 toc = time.time()-tic
                 print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                    _iter,dualUB,bestUB,bestLB,gap,relgap*100,delta,toc))
+                    _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc))
                 print("relgap (%g) <= gaptol (%g). Finished."%(
                     relgap, gaptol))
                 #--------------------------------------------
@@ -2134,15 +2183,15 @@ class LagrangeMaster(object):
                     print("WARNING: Non-anticipativity constraints not satisfied.")
                 #--------------------------------------------
                 break
-            elif np.mod(_iter, print_iter)==0:
-                toc = time.time()-tic
-                print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                    _iter,dualUB,bestUB,bestLB,gap,relgap*100,delta,toc))
+            else:
+                #----------------------------------------------------
+                # Update delta in objective according to trust region update rule
+                delta = max(delta_min, delta_mult*delta)
 
-            #----------------------------------------------------
-            # Update delta in objective according to trust region update rule
-            delta = max(delta_min, delta_mult*delta)
-            self.update_obj(delta, u0)
+                if np.mod(_iter, print_iter)==0:
+                    toc = time.time()-tic
+                    print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
+                        _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc))
 
         return x_dict
 
@@ -2164,3 +2213,48 @@ class LagrangeMaster(object):
                 y.VType = yt
 
         return x_dict
+
+    def make_feasible(self, method='heuristic'):
+        """
+        Make (and check) feasible solution using various methods.
+        """
+        sub_dict = self.sub_dict
+
+        ymat = np.array([[v.X for v in sub._ys] for sub in sub_dict.values()])
+        y0 = ymat.mean(axis=0).round()
+
+        return y0
+
+    def check_feasible(self, y0):
+        """
+        Check if y0 feasible for all subproblems.
+        """
+        sub_dict = self.sub_dict
+        precision_sub = self.precision_sub
+        var_dict = {}     # record orig bounds for later
+        obj_dict   = {}
+        stat_dict= {}
+        for sub_ind,sub in iteritems(sub_dict):
+            var_dict[sub_ind] = []
+            for j,y in enumerate(sub._ys):
+                var_dict[sub_ind].append({'LB':y.LB,'UB':y.UB,'VType':y.VType})
+                y.LB = y0[j]
+                y.UB = y0[j]
+                y.VType = GRB.CONTINUOUS    # Since fixed
+            sub.optimize()
+            stat_dict[sub_ind] = sub.model.Status
+            if sub.model.SolCount>0:
+                obj = sub._weight*sub.model.ObjVal
+            else:
+                obj = np.nan
+            obj_dict[sub_ind] = obj
+
+        for sub_ind,sub in iteritems(sub_dict):
+            # Reset bounds
+            for j,y in enumerate(sub._ys):
+                y.LB = var_dict[sub_ind][j]['LB']
+                y.UB = var_dict[sub_ind][j]['UB']
+                y.VType = var_dict[sub_ind][j]['VType']
+            sub.model.update()
+
+        return stat_dict, obj_dict
