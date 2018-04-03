@@ -1782,7 +1782,7 @@ class LagrangeMaster(object):
         self._us = None # Initialized with add_submodels
         self._z = None
         self._INF = 1e3
-        self.verbosity = 0
+        self.verbosity = 1
         self.gaptol = 1e-4    # relative gap tolerance
         self.absgaptol = 1e-6    # relative gap tolerance
         self.feastol = 1e-6
@@ -2120,8 +2120,9 @@ class LagrangeMaster(object):
                     # raise Exception(
                     #         "Relaxed subproblem is Infeasible or Unbounded. Status=%s (%s)."%(
                     #     status_dict[sub.model.Status], sub.model.Status))
-                    print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
-                        sub_ind, status_dict[sub.model.Status], sub.model.Status))
+                    if verbosity>0:
+                        print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
+                            sub_ind, status_dict[sub.model.Status], sub.model.Status))
                     return None
 
             toc_sub = time.time()-tic_sub
@@ -2161,8 +2162,10 @@ class LagrangeMaster(object):
                 y0 = sub_dict[sub_dict.keys()[0]].yopt
                 feasUB = UB
 
-            if feasUB < bestUB:
-                bestUB = feasUB
+            #if feasUB < bestUB:
+            #    bestUB = feasUB
+            if UB < bestUB:
+                bestUB = UB
                 ybest = y0
                 for j,yj in enumerate(y0):
                     x_dict[sub._ys[j].VarName] = yj
@@ -2191,10 +2194,11 @@ class LagrangeMaster(object):
                 toc = time.time()-tic
                 # print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s%12.8s%12.8s" % (
                 #     _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
-                print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                    _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
-                print("relgap (%g) <= gaptol (%g). Finished."%(
-                    relgap, gaptol))
+                if verbosity>0:
+                    print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                        _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
+                    print("relgap (%g) <= gaptol (%g). Finished."%(
+                        relgap, gaptol))
                 #--------------------------------------------
                 # Final QC that sum_k Hk*yk = 0
                 Hys = []
@@ -2202,9 +2206,10 @@ class LagrangeMaster(object):
                     yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
                     Hyk = sub._H*yk
                     Hys.append(Hyk)
-                print("sum_k Hk*yk: %s"%(sum(Hys)))
-                if sum([abs(x) for x in sum(Hys)]) > feastol:
-                    print("WARNING: Non-anticipativity constraints not satisfied.")
+                if verbosity>1:
+                    print("sum_k Hk*yk: %s"%(sum(Hys)))
+                    if sum([abs(x) for x in sum(Hys)]) > feastol:
+                        print("WARNING: Non-anticipativity constraints not satisfied.")
                 #--------------------------------------------
                 break
             else:
@@ -2214,15 +2219,15 @@ class LagrangeMaster(object):
 
                 if np.mod(_iter, print_iter)==0:
                     toc = time.time()-tic
-                    # print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s%12.8s%12.8s" % (
-                    #     _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
-                    print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                        _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
+                    if verbosity>0:
+                        print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                            _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
 
             # Check timelimit
             toc = time.time()-tic
             if toc > time_limit:
-                print("Stopping due to time limit of %g seconds."%time_limit)
+                if verbosity>0:
+                    print("Stopping due to time limit of %g seconds."%time_limit)
                 break
             else:
                 # Update time limits on all (sub)models

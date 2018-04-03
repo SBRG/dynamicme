@@ -256,6 +256,21 @@ class RadixEstimator(Estimator):
                             y.objective_coefficient=0.
                         else:
                             y.objective_coefficient=reg_weight
+        elif objective == 'sparse':
+            for mdl_ind,mdl in iteritems(model_dict):
+                if reset_obj:
+                    for rxn in mdl.reactions:
+                        rxn.objective_coefficient = 0.
+            for group_id in var_cons_dict.keys():
+                for l,pwr in enumerate(powers):
+                    for k,digit in enumerate(digits):
+                        yid = 'binary_%s%s%s'%(group_id,k,l)
+                        y   = stacker.model.reactions.get_by_id(yid)
+                        # Prefer pwr=0, digit=1
+                        if pwr==0 and digit==1:
+                            y.objective_coefficient=0.
+                        else:
+                            y.objective_coefficient=1.
         else:
             raise Exception("Objective=%s not supported!"%(objective))
 
