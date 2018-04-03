@@ -1788,7 +1788,8 @@ class LagrangeMaster(object):
         self.feastol = 1e-6
         self.precision_sub = 'gurobi'
         self.print_iter = 10
-        self.max_iter = 1000.
+        self.time_limit = 1e30  # seconds
+        self.max_iter = 1e6
         self.delta_min = 1e-10
         self.delta_mult = 0.5
         self.x_dict = {}
@@ -2011,7 +2012,7 @@ class LagrangeMaster(object):
 
         return cut
 
-    def optimize(self, feasible_method='heuristic', bundle=False, multicut=True):
+    def optimize(self, feasible_method='best', bundle=False, multicut=True):
         """
         x_dict = optimize()
 
@@ -2042,6 +2043,7 @@ class LagrangeMaster(object):
         sub_dict = self.sub_dict
         max_iter = self.max_iter
         print_iter = self.print_iter
+        time_limit = self.time_limit
         gaptol = self.gaptol
         absgaptol = self.absgaptol
         feastol = self.feastol
@@ -2072,15 +2074,21 @@ class LagrangeMaster(object):
         status_dict[GRB.NUMERIC] = 'numeric'
 
         tic = time.time()
-        print("%12.10s%12.8s%12.8s%12.8s%12.8s%12.10s%12.8s%12.8s" % (
-            'Iter','Dual UB','LB','Best LB','gap','relgap(%)','delta','time(s)'))
+        print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
+            'Iter','UB','LB','gap','relgap(%)','delta','Time(s)'))
+        print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
+            '-'*7,'-'*19,'-'*19,'-'*9,'-'*9,'-'*9,'-'*29))
+        print("%8.6s%11.8s%11.8s%11.8s%11.8s%10.8s%10.8s%10.8s%10.8s%10.8s%10.8s" % (
+            '','Dual','Feas','Sub','Best','','','','total','master','sub'))
 
         for _iter in range(max_iter):
             #----------------------------------------------------
             # Solve Master
             #----------------------------------------------------
+            tic_master = time.time()
             self.update_obj(delta, u0)
             model.optimize()
+            toc_master = time.time()-tic_master
             #if model.Status in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
             if model.SolCount > 0:
                 uk = np.array([u.X for u in self._us])
@@ -2097,6 +2105,7 @@ class LagrangeMaster(object):
             #----------------------------------------------------
             # Solve Subproblems
             #----------------------------------------------------
+            tic_sub = time.time()
             sub_objs = []
             for sub_ind,sub in iteritems(sub_dict):
                 sub.update_obj(uk)
@@ -2106,11 +2115,16 @@ class LagrangeMaster(object):
                     if multicut:
                         cut = self.make_multicut(sub)
                         model.addConstr(cut)
-
                 elif sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
-                    # If relaxed subproblem is infeasible, original problem was infeasible.
-                    raise Exception("Relaxed subproblem is Infeasible or Unbounded. Status=%s (%s)."%(
-                        status_dict[sub.model.Status], sub.model.Status))
+                    # If RELAXED subproblem is INFEASIBLE, ORIGINAL problem was INFEASIBLE.
+                    # raise Exception(
+                    #         "Relaxed subproblem is Infeasible or Unbounded. Status=%s (%s)."%(
+                    #     status_dict[sub.model.Status], sub.model.Status))
+                    print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
+                        sub_ind, status_dict[sub.model.Status], sub.model.Status))
+                    return None
+
+            toc_sub = time.time()-tic_sub
 
             if not multicut:
                 cut = self.make_supercut(sub_dict)
@@ -2118,28 +2132,34 @@ class LagrangeMaster(object):
 
             #----------------------------------------------------
             # Compute UB
-            UB = z.X
+            UB = z.X        # Lagrange dual UB
+            # A. Heuristic: first subproblem solution
+            # B. Heuristic: best subproblem solution
+            # C. Heuristic: some combination of subproblem solutions
             # Compute UB from feasible 
-            # y0 = self.make_feasible()
-            # y0 = sub_dict[sub_dict.keys()[0]].yopt
-            # sub_stats, obj_dict = self.check_feasible(y0)
-            # subobj_dict = {}
-            # for sub_ind,sub in iteritems(sub_dict):
-            #     y0 = np.array([v.X for v in sub._ys])
-            #     y0 = sub.yopt
-            #     sub_stats, obj_dict = self.check_feasible(y0)
-            #     subobj_dict[sub_ind] = sum(obj_dict.values())
+            if feasible_method=='best':
+                subobj_dict = {}
+                for sub_ind,sub in iteritems(sub_dict):
+                    y0 = sub.yopt
+                    sub_stats, obj_dict = self.check_feasible(y0)
+                    subobj_dict[sub_ind] = sum(obj_dict.values())
 
-            # minobj = min(subobj_dict.values())
-            # feasUB = minobj
-            # for sub_ind,sub in iteritems(sub_dict):
-            #     if subobj_dict[sub_ind]==minobj:
-            #         y0 = sub.yopt
-
-            # feasUB = sum(obj_dict.values())
-
-            y0 = sub_dict[sub_dict.keys()[0]].yopt
-            feasUB = UB
+                minobj = min(subobj_dict.values())
+                feasUB = minobj
+                for sub_ind,sub in iteritems(sub_dict):
+                    if subobj_dict[sub_ind]==minobj:
+                        y0 = sub.yopt
+            elif feasible_method=='first':
+                y0 = sub_dict[sub_dict.keys()[0]].yopt
+                sub_stats, obj_dict = self.check_feasible(y0)
+                feasUB = sum(obj_dict.values())
+            elif feasible_method=='average':
+                y0 = self.make_feasible()
+                sub_stats, obj_dict = self.check_feasible(y0)
+                feasUB = sum(obj_dict.values())
+            else:
+                y0 = sub_dict[sub_dict.keys()[0]].yopt
+                feasUB = UB
 
             if feasUB < bestUB:
                 bestUB = feasUB
@@ -2163,12 +2183,16 @@ class LagrangeMaster(object):
                 # for sub in sub_dict.values():
                 #     sub.x_dict = {x.VarName:x.X for x in sub.model.getVars()}
 
-            gap = bestUB-bestLB
-            relgap = gap/(1e-10+abs(bestUB))
+            #gap = bestUB-bestLB
+            #relgap = gap/(1e-10+abs(bestUB))
+            gap = UB-bestLB
+            relgap = gap/(1e-10+abs(UB))
             if relgap <= gaptol:
                 toc = time.time()-tic
-                print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                    _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc))
+                # print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s%12.8s%12.8s" % (
+                #     _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
+                print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                    _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
                 print("relgap (%g) <= gaptol (%g). Finished."%(
                     relgap, gaptol))
                 #--------------------------------------------
@@ -2190,8 +2214,22 @@ class LagrangeMaster(object):
 
                 if np.mod(_iter, print_iter)==0:
                     toc = time.time()-tic
-                    print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s" % (
-                        _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc))
+                    # print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s%12.8s%12.8s" % (
+                    #     _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
+                    print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                        _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
+
+            # Check timelimit
+            toc = time.time()-tic
+            if toc > time_limit:
+                print("Stopping due to time limit of %g seconds."%time_limit)
+                break
+            else:
+                # Update time limits on all (sub)models
+                time_left = time_limit-toc
+                model.Params.TimeLimit = time_left
+                for sub in sub_dict.values():
+                    sub.model.Params.TimeLimit = time_left
 
         return x_dict
 
