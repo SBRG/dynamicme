@@ -2186,10 +2186,10 @@ class LagrangeMaster(object):
                 # for sub in sub_dict.values():
                 #     sub.x_dict = {x.VarName:x.X for x in sub.model.getVars()}
 
-            #gap = bestUB-bestLB
-            #relgap = gap/(1e-10+abs(bestUB))
-            gap = UB-bestLB
-            relgap = gap/(1e-10+abs(UB))
+            gap = bestUB-bestLB
+            relgap = gap/(1e-10+abs(bestUB))
+            #gap = UB-bestLB
+            #relgap = gap/(1e-10+abs(UB))
             if relgap <= gaptol:
                 toc = time.time()-tic
                 # print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s%12.8s%12.8s" % (
