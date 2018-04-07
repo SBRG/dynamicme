@@ -2017,7 +2017,7 @@ class LagrangeMaster(object):
         return cut
 
     def optimize(self, feasible_method='enumerate', bundle=False, multicut=True,
-            max_alt=100, alt_method='pool'):
+            max_alt=100, alt_method='pool', nogood_cuts=False):
         """
         x_dict = optimize()
 
@@ -2065,6 +2065,7 @@ class LagrangeMaster(object):
         us = self._us
         nu = len(us)
 
+        feasUB = 1e100
         dualUB = 1e100  # Overestimator from master, with supergradient-based polyhedral approx
                         # Should decrease monotonically
         UB = 1e100      # UB from feasible solution. Not necessarily monotonic, depending
@@ -2089,6 +2090,11 @@ class LagrangeMaster(object):
             '-'*7,'-'*19,'-'*19,'-'*9,'-'*9,'-'*9,'-'*29))
         print("%8.6s%11.8s%11.8s%11.8s%11.8s%10.8s%10.8s%10.8s%10.8s%10.8s%10.8s" % (
             '','Dual','Best','Sub','Best','','','','total','master','sub'))
+
+        # Don't pool solutions until gap below tolerance
+        for sub in sub_dict.values():
+            sub.model.Params.PoolSearchMode=0
+            sub.model.Params.PoolSolutions =1
 
         for _iter in range(max_iter):
             #----------------------------------------------------
@@ -2147,15 +2153,6 @@ class LagrangeMaster(object):
             UB = z.X        # Lagrange dual UB
             dualUB = UB
             bestUB = UB
-
-            # if UB < bestUB:
-            #     bestUB = UB
-                # ybest = y0
-                # for j,yj in enumerate(y0):
-                #     x_dict[sub._ys[j].VarName] = yj
-                # ubest  = uk   # uk better if LB improved.
-                # self.uopt = ubest
-
             #----------------------------------------------------
             # Update bounds and check convergence
             LB = sum(sub_objs)
@@ -2163,14 +2160,7 @@ class LagrangeMaster(object):
                 bestLB = LB
                 ubest  = uk     # Record best multipliers that improved LB
                 self.uopt = ubest
-                # ybest = y0
-                # for j,yj in enumerate(y0):
-                #     x_dict[sub._ys[j].VarName] = yj
-                # # Save best master solution
                 self.x_dict = {v.VarName:v.X for v in model.getVars()}
-                # Also keep the best submodel solutions
-                # for sub in sub_dict.values():
-                #     sub.x_dict = {x.VarName:x.X for x in sub.model.getVars()}
 
             # Quadratic stabilization term can cause "best" LB and UB to change
             # non monotonically, not guaranteeing bestUB > bestLB
@@ -2189,28 +2179,34 @@ class LagrangeMaster(object):
                 #--------------------------------------------
                 # Now, look for a feasible solution
                 if feasible_method is not None:
-                    yfeas, enum_dict = self.enum_alt_opt(first_feasible=True,
-                            max_alt=max_alt, method=alt_method)
+                    yfeas, feasUBk, is_optimal = self.enum_alt_opt(first_feasible=True,
+                            max_alt=max_alt, method=alt_method, nogood_cuts=nogood_cuts)
                     if yfeas is not None:
                         #--------------------------------------------
-                        # Final solution
-                        ybest = yfeas
-                        self.yopt = ybest
-                        for j,yj in enumerate(yfeas):
-                            x_dict[sub._ys[j].VarName] = yj
-                        #--------------------------------------------
-                        # Final QC that sum_k Hk*yk = 0
-                        Hys = []
-                        for sub_ind,sub in iteritems(sub_dict):
-                            yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
-                            Hyk = sub._H*yk
-                            Hys.append(Hyk)
-                        if verbosity>1:
-                            print("sum_k Hk*yk: %s"%(sum(Hys)))
-                            if sum([abs(x) for x in sum(Hys)]) > feastol:
-                                print("WARNING: Non-anticipativity constraints not satisfied.")
-                        #--------------------------------------------
-                        break
+                        # Final solution candidate
+                        if feasUBk < feasUB:
+                            feasUB = feasUBk
+                            ybest = yfeas
+                            self.yopt = ybest
+                            for j,yj in enumerate(ybest):
+                                x_dict[sub._ys[j].VarName] = yj
+                            if verbosity>1:
+                                print("Best feasible solution has objval=%s"%(feasUB))
+
+                        if is_optimal:
+                            #--------------------------------------------
+                            # Final QC that sum_k Hk*yk = 0
+                            Hys = []
+                            for sub_ind,sub in iteritems(sub_dict):
+                                yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
+                                Hyk = sub._H*yk
+                                Hys.append(Hyk)
+                            if verbosity>1:
+                                print("sum_k Hk*yk: %s"%(sum(Hys)))
+                                if sum([abs(x) for x in sum(Hys)]) > feastol:
+                                    print("WARNING: Non-anticipativity constraints not satisfied.")
+                            #--------------------------------------------
+                            break
                     else:
                         if verbosity>0:
                             print("Feasible solution not among alt opt. Trying next iteration.")
@@ -2221,7 +2217,6 @@ class LagrangeMaster(object):
             # Update delta in objective according to trust region update rule
             delta = max(delta_min, delta_mult*delta)
             # Also update uk as per proximal point method
-            #u0 = ubest
             u0 = uk     # update even if not better?
 
             if np.mod(_iter, print_iter)==0:
@@ -2265,7 +2260,7 @@ class LagrangeMaster(object):
 
         return x_dict
 
-    def add_int_cut(self, sub):
+    def add_int_cut(self, sub, yk):
         """
         Add int cut to submodel.
         For binary variables:
@@ -2278,10 +2273,9 @@ class LagrangeMaster(object):
         model = sub.model
         n1 = 0.
         ys = sub._ys
-        yopt = sub.yopt
         coeffs = np.zeros(len(ys))
-        for j,y in enumerate(yopt):
-            if y >= 0.9:
+        for j,y in enumerate(yk):
+            if y >= 0.5:
                 coeffs[j] = -1.
                 n1 += y
             else:
@@ -2292,7 +2286,7 @@ class LagrangeMaster(object):
 
         return cut
 
-    def enum_alt_opt(self, first_feasible=True, max_alt=100, method='pool'):
+    def enum_alt_opt(self, first_feasible=True, max_alt=100, method='pool', nogood_cuts=False):
         """
         Enumerate solutions by adding integer cuts while keeping objective fixed.
 
@@ -2301,8 +2295,12 @@ class LagrangeMaster(object):
         """
         sub_dict = self.sub_dict
         yfeas = None
+        is_optimal = False
+        feasUBk = None
         stat_dict = {}
         opt_obj = sum([sub.ObjVal for sub in sub_dict.values()])
+        feas_objs = []
+        feas_sols = []
 
         if method=='pool':
             # Use solver feature to pool n best sols
@@ -2324,6 +2322,7 @@ class LagrangeMaster(object):
                         else:
                             # Ordered by worsening obj so can break at first subopt obj
                             break
+                    #----------------------------------------
                     # Run this after collecting all solutions since it modifies the problem
                     alt_objs = []
                     for k,yk in enumerate(alt_sols):
@@ -2331,26 +2330,45 @@ class LagrangeMaster(object):
                         are_feas = feas_dict.values()
                         tot_obj = sum(obj_dict.values())
                         alt_objs.append(tot_obj)
-                        is_optimal = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj)) <= self.gaptol
+                        gap = abs(tot_obj-opt_obj)
+                        relgap = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj))
+
+                        is_optimal = gap <= self.absgaptol or relgap <= self.gaptol
                         stats = np.array(sub_stats.values())
                         stat_dict[sub_ind] = stats
 
-                        if is_optimal and np.all(are_feas):
-                            yfeas = yk
-                            if self.verbosity > 1:
-                                print("Best obj=%g. Tot obj=%g. obj=%g for %s"%(
-                                    opt_obj, tot_obj, sub.ObjVal,sub_ind))
-                                print("Alt optimum %d in subprob %s is feasible! Done."%(
-                                    k, sub_ind))
-                            return yfeas, stat_dict
-                    if self.verbosity > 1:
-                        print("No optimal feasible solution among %d alt optimal"%len(alt_sols))
-                        print("Best feasible solution has objval=%s"%(min(alt_objs)))
+                        if np.all(are_feas):
+                            feas_objs.append(tot_obj)
+                            feas_sols.append(yk)
+                            if is_optimal:
+                                feasUBk = tot_obj
+                                yfeas   = yk
+                                # Want to stop enumerating immediately
+                                if self.verbosity > 1:
+                                    print("Best obj=%g. Tot obj=%g. obj=%g for %s"%(
+                                        opt_obj, tot_obj, sub.ObjVal,sub_ind))
+                                    print("Alt optimum %d in subprob %s is feasible! Done."%(
+                                        k, sub_ind))
+                                return yfeas, feasUBk, is_optimal
+
+                    # Integer (no-good) cuts exclude alt opt infeasible points
+                    if nogood_cuts:
+                        for yk in alt_sols:
+                            self.add_int_cut(sub, yk)
+                        if self.verbosity > 1:
+                            print("Excluded %d infeasible alt optima"%(len(alt_sols)))
 
                 else:
                     if self.verbosity>1:
                         print("No pool solution available for %s"%sub_ind)
                     break
+            #----------------------------------------
+            # Save best feasible so far
+            feasUBk = min(feas_objs)
+            yfeas   = feas_sols[feas_objs.index(feasUBk)]
+            if self.verbosity > 1:
+                print("Best feasible solution among %d alt feasible has objval=%s"%(
+                    len(feas_sols), feasUBk))
 
         else:
             fixobj_id = 'fixobjval'
@@ -2403,7 +2421,7 @@ class LagrangeMaster(object):
                     intcuts = []
                     for icut in range(max_alt):
                         # Add int cut
-                        intcut = self.add_int_cut(sub)
+                        intcut = self.add_int_cut(sub, [v.X for v in sub._ys])
                         intcuts.append(intcut)
                         model.update()
                         # Solve and check if feasible
@@ -2438,10 +2456,11 @@ class LagrangeMaster(object):
                         model.remove(intcut)
                     model.update()
 
-        return yfeas, stat_dict
+        return yfeas, feasUBk, is_optimal
 
 
-    def make_feasible(self, feasible_method='enumerate', alt_method='pool', max_alt=100):
+    def make_feasible(self, feasible_method='enumerate', alt_method='pool', max_alt=100,
+            nogood_cuts=False):
         """
         Make (and check) feasible solution using various methods.
         """
@@ -2450,7 +2469,8 @@ class LagrangeMaster(object):
         if feasible_method=='enumerate':
             # If there exists at least one primal feasible,
             # enumerate alternative optimal dual solutions until found.
-            y0,enum_dict = self.enum_alt_opt(max_alt=max_alt, method=alt_method)
+            y0, feasUBk, is_optimal = self.enum_alt_opt(max_alt=max_alt, method=alt_method,
+                    nogood_cuts=nogood_cuts)
         elif feasible_method=='best':
             subobj_dict = {}
             for sub_ind,sub in iteritems(sub_dict):
