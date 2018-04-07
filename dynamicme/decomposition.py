@@ -1786,6 +1786,7 @@ class LagrangeMaster(object):
         self.gaptol = 1e-4    # relative gap tolerance
         self.absgaptol = 1e-6    # relative gap tolerance
         self.feastol = 1e-6
+        self.penaltytol = 1e-6
         self.precision_sub = 'gurobi'
         self.print_iter = 10
         self.time_limit = 1e30  # seconds
@@ -1793,6 +1794,7 @@ class LagrangeMaster(object):
         self.delta_min = 1e-10
         self.delta_mult = 0.5
         self.x_dict = {}
+        self.yopt = None
 
         self.model = self.init_model(ys)
 
@@ -1815,6 +1817,8 @@ class LagrangeMaster(object):
         """
         #----------------------------------------------------
         # max  z - delta/2 ||u - u0||2
+        # max  z - delta/2*(u^2 - 2*u*u0 + u0^2)
+        # max  z - delta/2*u^2 + delta*u*u0 - delta/2*u0^2
         #----------------------------------------------------
         """
         model = self.model
@@ -2012,7 +2016,8 @@ class LagrangeMaster(object):
 
         return cut
 
-    def optimize(self, feasible_method='best', bundle=False, multicut=True):
+    def optimize(self, feasible_method='enumerate', bundle=False, multicut=True,
+            max_alt=100, alt_method='pool'):
         """
         x_dict = optimize()
 
@@ -2035,6 +2040,9 @@ class LagrangeMaster(object):
                             D(wk+1) >= D(uk) + a*(D(wk+1)-D(uk))
                             where a\in (0,1) is an Armijo-like parameter.
                             Else, wk+1 = uk
+        max_alt : maximum alternate optima to pool or search for when
+                  duality gap meets threshold
+        alt_method : Use solver's pool feature (pool) or with int cuts (intcuts)
 
         Outputs
         x_dict : {x.VarName:x.X}
@@ -2047,6 +2055,7 @@ class LagrangeMaster(object):
         gaptol = self.gaptol
         absgaptol = self.absgaptol
         feastol = self.feastol
+        penaltytol = self.penaltytol
         verbosity = self.verbosity
         delta_min = self.delta_min
         delta_mult= self.delta_mult
@@ -2056,7 +2065,7 @@ class LagrangeMaster(object):
         us = self._us
         nu = len(us)
 
-        dualUB = 1e100# Overestimator from master, with supergradient-based polyhedral approx
+        dualUB = 1e100  # Overestimator from master, with supergradient-based polyhedral approx
                         # Should decrease monotonically
         UB = 1e100      # UB from feasible solution. Not necessarily monotonic, depending
                         # method used to construct feasible solution.
@@ -2075,11 +2084,11 @@ class LagrangeMaster(object):
 
         tic = time.time()
         print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
-            'Iter','UB','LB','gap','relgap(%)','delta','Time(s)'))
+            'Iter','UB','LB','gap','relgap(%)','penalty','Time(s)'))
         print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
             '-'*7,'-'*19,'-'*19,'-'*9,'-'*9,'-'*9,'-'*29))
         print("%8.6s%11.8s%11.8s%11.8s%11.8s%10.8s%10.8s%10.8s%10.8s%10.8s%10.8s" % (
-            '','Dual','Feas','Sub','Best','','','','total','master','sub'))
+            '','Dual','Best','Sub','Best','','','','total','master','sub'))
 
         for _iter in range(max_iter):
             #----------------------------------------------------
@@ -2109,7 +2118,9 @@ class LagrangeMaster(object):
             sub_objs = []
             for sub_ind,sub in iteritems(sub_dict):
                 sub.update_obj(uk)
-                obj = sub.optimize()
+                #********************************************
+                obj = sub.optimize(yk=sub.yopt)
+                #********************************************
                 sub_objs.append(obj)
                 if sub.model.Status == GRB.OPTIMAL:
                     if multicut:
@@ -2134,94 +2145,91 @@ class LagrangeMaster(object):
             #----------------------------------------------------
             # Compute UB
             UB = z.X        # Lagrange dual UB
-            # A. Heuristic: first subproblem solution
-            # B. Heuristic: best subproblem solution
-            # C. Heuristic: some combination of subproblem solutions
-            # Compute UB from feasible 
-            if feasible_method=='best':
-                subobj_dict = {}
-                for sub_ind,sub in iteritems(sub_dict):
-                    y0 = sub.yopt
-                    sub_stats, obj_dict = self.check_feasible(y0)
-                    subobj_dict[sub_ind] = sum(obj_dict.values())
+            dualUB = UB
+            bestUB = UB
 
-                minobj = min(subobj_dict.values())
-                feasUB = minobj
-                for sub_ind,sub in iteritems(sub_dict):
-                    if subobj_dict[sub_ind]==minobj:
-                        y0 = sub.yopt
-            elif feasible_method=='first':
-                y0 = sub_dict[sub_dict.keys()[0]].yopt
-                sub_stats, obj_dict = self.check_feasible(y0)
-                feasUB = sum(obj_dict.values())
-            elif feasible_method=='average':
-                y0 = self.make_feasible()
-                sub_stats, obj_dict = self.check_feasible(y0)
-                feasUB = sum(obj_dict.values())
-            else:
-                y0 = sub_dict[sub_dict.keys()[0]].yopt
-                feasUB = UB
-
-            #if feasUB < bestUB:
-            #    bestUB = feasUB
-            if UB < bestUB:
-                bestUB = UB
-                ybest = y0
-                for j,yj in enumerate(y0):
-                    x_dict[sub._ys[j].VarName] = yj
-                ubest  = uk
-                self.uopt = ubest
+            # if UB < bestUB:
+            #     bestUB = UB
+                # ybest = y0
+                # for j,yj in enumerate(y0):
+                #     x_dict[sub._ys[j].VarName] = yj
+                # ubest  = uk   # uk better if LB improved.
+                # self.uopt = ubest
 
             #----------------------------------------------------
             # Update bounds and check convergence
-            dualUB = z.X
             LB = sum(sub_objs)
             if LB > bestLB:
                 bestLB = LB
-                ubest  = uk
-                # Save best master solution
-                self.x_dict = {v.VarName:v.X for v in model.getVars()}
+                ubest  = uk     # Record best multipliers that improved LB
                 self.uopt = ubest
+                # ybest = y0
+                # for j,yj in enumerate(y0):
+                #     x_dict[sub._ys[j].VarName] = yj
+                # # Save best master solution
+                self.x_dict = {v.VarName:v.X for v in model.getVars()}
                 # Also keep the best submodel solutions
                 # for sub in sub_dict.values():
                 #     sub.x_dict = {x.VarName:x.X for x in sub.model.getVars()}
 
-            gap = bestUB-bestLB
+            # Quadratic stabilization term can cause "best" LB and UB to change
+            # non monotonically, not guaranteeing bestUB > bestLB
+            gap = abs(bestUB-bestLB)
+            if abs(gap)<absgaptol:
+                gap = 0.
             relgap = gap/(1e-10+abs(bestUB))
-            #gap = UB-bestLB
-            #relgap = gap/(1e-10+abs(UB))
-            if relgap <= gaptol:
+            res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
+            if relgap <= gaptol and abs(res_u)<penaltytol:
+                #--------------------------------------------
                 toc = time.time()-tic
-                # print("%12.10s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%12.8s%12.8s%12.8s" % (
-                #     _iter,dualUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
                 if verbosity>0:
-                    print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                        _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
-                    print("relgap (%g) <= gaptol (%g). Finished."%(
-                        relgap, gaptol))
+                    print(
+                    "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                    _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
                 #--------------------------------------------
-                # Final QC that sum_k Hk*yk = 0
-                Hys = []
-                for sub_ind,sub in iteritems(sub_dict):
-                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
-                    Hyk = sub._H*yk
-                    Hys.append(Hyk)
-                if verbosity>1:
-                    print("sum_k Hk*yk: %s"%(sum(Hys)))
-                    if sum([abs(x) for x in sum(Hys)]) > feastol:
-                        print("WARNING: Non-anticipativity constraints not satisfied.")
-                #--------------------------------------------
-                break
-            else:
-                #----------------------------------------------------
-                # Update delta in objective according to trust region update rule
-                delta = max(delta_min, delta_mult*delta)
+                # Now, look for a feasible solution
+                if feasible_method is not None:
+                    yfeas, enum_dict = self.enum_alt_opt(first_feasible=True,
+                            max_alt=max_alt, method=alt_method)
+                    if yfeas is not None:
+                        #--------------------------------------------
+                        # Final solution
+                        ybest = yfeas
+                        self.yopt = ybest
+                        for j,yj in enumerate(yfeas):
+                            x_dict[sub._ys[j].VarName] = yj
+                        #--------------------------------------------
+                        # Final QC that sum_k Hk*yk = 0
+                        Hys = []
+                        for sub_ind,sub in iteritems(sub_dict):
+                            yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
+                            Hyk = sub._H*yk
+                            Hys.append(Hyk)
+                        if verbosity>1:
+                            print("sum_k Hk*yk: %s"%(sum(Hys)))
+                            if sum([abs(x) for x in sum(Hys)]) > feastol:
+                                print("WARNING: Non-anticipativity constraints not satisfied.")
+                        #--------------------------------------------
+                        break
+                    else:
+                        if verbosity>0:
+                            print("Feasible solution not among alt opt. Trying next iteration.")
+                else:
+                    break
 
-                if np.mod(_iter, print_iter)==0:
-                    toc = time.time()-tic
-                    if verbosity>0:
-                        print("%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                            _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,delta,toc,toc_master,toc_sub))
+            #----------------------------------------------------
+            # Update delta in objective according to trust region update rule
+            delta = max(delta_min, delta_mult*delta)
+            # Also update uk as per proximal point method
+            #u0 = ubest
+            u0 = uk     # update even if not better?
+
+            if np.mod(_iter, print_iter)==0:
+                toc = time.time()-tic
+                if verbosity>0:
+                    print(
+                    "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                    _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
 
             # Check timelimit
             toc = time.time()-tic
@@ -2238,7 +2246,7 @@ class LagrangeMaster(object):
 
         return x_dict
 
-    def solve_relaxed(self):
+    def solve_relaxed(self,*args,**kwargs):
         """
         Solve LP relaxation.
         """
@@ -2248,7 +2256,7 @@ class LagrangeMaster(object):
         for sub in sub_dict.values():
             for y in sub._ys:
                 y.VType = GRB.CONTINUOUS
-        x_dict = self.optimize()
+        x_dict = self.optimize(*args,**kwargs)
 
         # Make integer/binary again
         for sub_ind,sub in iteritems(sub_dict):
@@ -2257,14 +2265,212 @@ class LagrangeMaster(object):
 
         return x_dict
 
-    def make_feasible(self, method='heuristic'):
+    def add_int_cut(self, sub):
+        """
+        Add int cut to submodel.
+        For binary variables:
+        sum_{yk=1} (1-y) + sum_{yk=0} yk >= 1
+        -sum_{yk=1} yk + sum_{yk=0} yk >= 1 - n1
+
+        For general integers?:
+        sum_{yk>0} (yk - y) + sum_{yk==0} yk >= 1
+        """
+        model = sub.model
+        n1 = 0.
+        ys = sub._ys
+        yopt = sub.yopt
+        coeffs = np.zeros(len(ys))
+        for j,y in enumerate(yopt):
+            if y >= 0.9:
+                coeffs[j] = -1.
+                n1 += y
+            else:
+                coeffs[j] = 1.
+        lhs = LinExpr(coeffs, ys)
+        rhs = 1-n1
+        cut = model.addConstr(lhs, GRB.GREATER_EQUAL, rhs, name='intcut')
+
+        return cut
+
+    def enum_alt_opt(self, first_feasible=True, max_alt=100, method='pool'):
+        """
+        Enumerate solutions by adding integer cuts while keeping objective fixed.
+
+        Inputs
+        first_feasible : stop as soon as feasible solution found
+        """
+        sub_dict = self.sub_dict
+        yfeas = None
+        stat_dict = {}
+        opt_obj = sum([sub.ObjVal for sub in sub_dict.values()])
+
+        if method=='pool':
+            # Use solver feature to pool n best sols
+            for sub_ind,sub in iteritems(sub_dict):
+                sub.model.Params.PoolSearchMode=2   # Keep n best sols
+                sub.model.Params.PoolSolutions = max_alt
+                sub.optimize()
+                bestobj = sub.ObjVal
+
+                if sub.model.SolCount>0:
+                    alt_sols = []
+                    for k in range(sub.model.SolCount):
+                        sub.model.Params.SolutionNumber=k
+                        objk = sub.model.PoolObjVal
+                        # Only keep if alt optimal for this subproblem
+                        if abs(objk-bestobj)/(1e-10+abs(bestobj))<=self.gaptol:
+                            yk = np.array([y.Xn for y in sub._ys])
+                            alt_sols.append(yk)
+                        else:
+                            # Ordered by worsening obj so can break at first subopt obj
+                            break
+                    # Run this after collecting all solutions since it modifies the problem
+                    for k,yk in enumerate(alt_sols):
+                        obj_dict, feas_dict, sub_stats = self.check_feasible(yk)
+                        are_feas = feas_dict.values()
+                        tot_obj = sum(obj_dict.values())
+                        is_optimal = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj)) <= self.gaptol
+                        stats = np.array(sub_stats.values())
+                        stat_dict[sub_ind] = stats
+
+                        if is_optimal and np.all(are_feas):
+                            yfeas = yk
+                            if self.verbosity > 1:
+                                print("Best obj=%g. Tot obj=%g. obj=%g for %s"%(
+                                    opt_obj, tot_obj, sub.ObjVal,sub_ind))
+                                print("Alt optimum %d in subprob %s is feasible! Done."%(
+                                    k, sub_ind))
+                            return yfeas, stat_dict
+                else:
+                    if self.verbosity>1:
+                        print("No pool solution available for %s"%sub_ind)
+                    break
+
+        else:
+            fixobj_id = 'fixobjval'
+            if self.verbosity>1:
+                print("Finding feasible solution with optimal obj=%s"%opt_obj)
+
+            for sub_ind,sub in iteritems(sub_dict):
+                #------------------------------------------------
+                # Check if feasible and still optimal
+                y0 = sub.yopt
+                obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+                are_feas = feas_dict.values()
+                tot_obj = sum(obj_dict.values())
+                is_optimal = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj)) <= self.gaptol
+                stats = np.array(sub_stats.values())
+                stat_dict[sub_ind] = stats
+
+                #if is_optimal and np.all(stats==GRB.OPTIMAL):
+                if is_optimal and np.all(are_feas):
+                    yfeas = y0
+                    if self.verbosity > 1:
+                        print("Tot obj=%g. obj=%g for %s"%(
+                            tot_obj, sub.ObjVal,sub_ind))
+                        print("Found feasible alt opt before int cuts. Stopping.")
+                    break
+                else:
+                    # Constrain this submodel's objective
+                    model = sub.model
+                    cons = model.getConstrByName(fixobj_id)
+                    if cons is None:
+                        expr = model.getObjective() == sub.ObjVal
+                        cons = model.addConstr(expr, name=fixobj_id)
+                    else:
+                        cons.RHS = sub.ObjVal
+                        cons.Sense = GRB.EQUAL
+                        # Reset all coeffs
+                        row = model.getRow(cons)
+                        for j in range(row.size()):
+                            v = row.getVar(j)
+                            model.chgCoeff(cons, v, 0.)
+                        # Update to actual coeffs
+                        obj = model.getObjective()
+                        for j in range(obj.size()):
+                            v = obj.getVar(j)
+                            model.chgCoeff(cons, v, obj.getCoeff(j))
+
+                    #------------------------------------------------
+                    # Enumerate alt optima
+                    n_alt = 0
+                    intcuts = []
+                    for icut in range(max_alt):
+                        # Add int cut
+                        intcut = self.add_int_cut(sub)
+                        intcuts.append(intcut)
+                        model.update()
+                        # Solve and check if feasible
+                        sub.optimize()
+                        is_feasible = sub.model.SolCount>0
+                        if not is_feasible:
+                            break
+                        else:
+                            n_alt += 1
+                            y0 = sub.yopt
+                            obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+                            tot_obj = sum(obj_dict.values())
+                            is_optimal = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj)) <= self.gaptol
+                            #if is_optimal and np.all(stats==GRB.OPTIMAL):
+                            are_feas = feas_dict.values()
+                            if is_optimal and np.all(are_feas):
+                                yfeas = y0
+                                if self.verbosity > 1:
+                                    print("Alt optima %d is feasible! Stopping."%n_alt)
+                                    # print("Found feasible alt opt. Stopping.")
+                                break
+                    #------------------------------------------------
+                    # Relax all the constraints for next outer iter
+                    cons = model.getConstrByName(fixobj_id)
+                    cons.Sense = GRB.LESS_EQUAL
+                    cons.RHS = GRB.INFINITY
+                    # model.remove(cons)
+                    if self.verbosity>1:
+                        print("Tot obj=%g. Found %d alt optima with obj=%g for %s"%(
+                            tot_obj, n_alt, sub.ObjVal,sub_ind))
+                    for intcut in intcuts:
+                        model.remove(intcut)
+                    model.update()
+
+        return yfeas, stat_dict
+
+
+    def make_feasible(self, feasible_method='enumerate', alt_method='pool', max_alt=100):
         """
         Make (and check) feasible solution using various methods.
         """
         sub_dict = self.sub_dict
+        # Compute UB from feasible 
+        if feasible_method=='enumerate':
+            # If there exists at least one primal feasible,
+            # enumerate alternative optimal dual solutions until found.
+            y0,enum_dict = self.enum_alt_opt(max_alt=max_alt, method=alt_method)
+        elif feasible_method=='best':
+            subobj_dict = {}
+            for sub_ind,sub in iteritems(sub_dict):
+                y0 = sub.yopt
+                obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+                subobj_dict[sub_ind] = sum(obj_dict.values())
 
-        ymat = np.array([[v.X for v in sub._ys] for sub in sub_dict.values()])
-        y0 = ymat.mean(axis=0).round()
+            minobj = min(subobj_dict.values())
+            feasUB = minobj
+            for sub_ind,sub in iteritems(sub_dict):
+                if subobj_dict[sub_ind]==minobj:
+                    y0 = sub.yopt
+        elif feasible_method=='first':
+            y0 = sub_dict[sub_dict.keys()[0]].yopt
+            obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+            feasUB = sum(obj_dict.values())
+        elif feasible_method=='average':
+            ymat = np.array([[v.X for v in sub._ys] for sub in sub_dict.values()])
+            y0 = ymat.mean(axis=0).round()
+            obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+            feasUB = sum(obj_dict.values())
+        elif feasible_method is None:
+            y0 = sub_dict[sub_dict.keys()[0]].yopt
+            feasUB = UB
+        else:
+            raise Exception("Unknown feasibility restoring method: %s"%feasible_method)
 
         return y0
 
@@ -2277,6 +2483,7 @@ class LagrangeMaster(object):
         var_dict = {}     # record orig bounds for later
         obj_dict   = {}
         stat_dict= {}
+        feas_dict= {}
         for sub_ind,sub in iteritems(sub_dict):
             var_dict[sub_ind] = []
             for j,y in enumerate(sub._ys):
@@ -2286,6 +2493,7 @@ class LagrangeMaster(object):
                 y.VType = GRB.CONTINUOUS    # Since fixed
             sub.optimize()
             stat_dict[sub_ind] = sub.model.Status
+            feas_dict[sub_ind] = sub.model.SolCount>0
             if sub.model.SolCount>0:
                 obj = sub._weight*sub.model.ObjVal
             else:
@@ -2300,4 +2508,4 @@ class LagrangeMaster(object):
                 y.VType = var_dict[sub_ind][j]['VType']
             sub.model.update()
 
-        return stat_dict, obj_dict
+        return obj_dict, feas_dict, stat_dict
