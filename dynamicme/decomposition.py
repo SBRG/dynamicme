@@ -2325,10 +2325,12 @@ class LagrangeMaster(object):
                             # Ordered by worsening obj so can break at first subopt obj
                             break
                     # Run this after collecting all solutions since it modifies the problem
+                    alt_objs = []
                     for k,yk in enumerate(alt_sols):
                         obj_dict, feas_dict, sub_stats = self.check_feasible(yk)
                         are_feas = feas_dict.values()
                         tot_obj = sum(obj_dict.values())
+                        alt_objs.append(tot_obj)
                         is_optimal = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj)) <= self.gaptol
                         stats = np.array(sub_stats.values())
                         stat_dict[sub_ind] = stats
@@ -2341,6 +2343,10 @@ class LagrangeMaster(object):
                                 print("Alt optimum %d in subprob %s is feasible! Done."%(
                                     k, sub_ind))
                             return yfeas, stat_dict
+                    if self.verbosity > 1:
+                        print("No optimal feasible solution among %d alt optimal"%len(alt_sols))
+                        print("Best feasible solution has objval=%s"%(min(alt_objs)))
+
                 else:
                     if self.verbosity>1:
                         print("No pool solution available for %s"%sub_ind)
