@@ -703,19 +703,24 @@ class DecompModel(object):
 
         # Translate qminos solution to original solver format
 
-def split_cobra(model):
+def split_cobra(model, first_stage_vars=None):
     """
     INPUTS
     model : cobra model
 
     Splits constraints into continuous and integer parts.
     Complicating constraints:       Ax + By [<=>] d
-    Integer-only constraints:            Cy [<=>] b
-    Continuous-only constraints:    Dx      [<=>] e
+    First-stage-only constraints:        Cy [<=>] b
+    Second-stage-only constraints:  Dx      [<=>] e
     """
     intvar_types = ['integer','binary']
-    xs = [x for x in model.reactions if x.variable_kind == 'continuous']
-    ys = [x for x in model.reactions if x.variable_kind in intvar_types]
+    if first_stage_vars is None:
+        xs = [x for x in model.reactions if x.variable_kind == 'continuous']
+        ys = [x for x in model.reactions if x.variable_kind in intvar_types]
+    else:
+        ys = first_stage_vars
+        xs = [x for x in model.reactions if x not in first_stage_vars]
+
     csenses = [x._constraint_sense for x in model.metabolites]
     d = [x._bound for x in model.metabolites]
     xdata = []
@@ -728,19 +733,21 @@ def split_cobra(model):
     for row_idx, met in enumerate(model.metabolites):
         for rxn in met.reactions:
             coeff = rxn.metabolites[met]
-            if rxn.variable_kind == 'continuous':
-                col_idx = xs.index(rxn)
-                xdata.append(coeff)
-                xcol_inds.append(col_idx)
-                xrow_inds.append(row_idx)
-            elif rxn.variable_kind in intvar_types:
+            if rxn in ys:
                 col_idx = ys.index(rxn)
                 ydata.append(coeff)
                 ycol_inds.append(col_idx)
                 yrow_inds.append(row_idx)
             else:
-                print("rxn.variable_kind must be in ['continuous','integer','binary']")
-                raise Exception("rxn.variable_kind must be in ['continuous','integer','binary']")
+                #if rxn.variable_kind == 'continuous':
+                col_idx = xs.index(rxn)
+                xdata.append(coeff)
+                xcol_inds.append(col_idx)
+                xrow_inds.append(row_idx)
+            #elif rxn.variable_kind in intvar_types:
+            # else:
+            #     print("rxn.variable_kind must be in ['continuous','integer','binary']")
+            #     raise Exception("rxn.variable_kind must be in ['continuous','integer','binary']")
 
     M  = len(model.metabolites)
     nx = len(xs)
@@ -1563,13 +1570,13 @@ class LagrangeSubmodel(object):
     where uk are Lagrange multipliers updated by Lagrangean master problem,
     and Hk constrain yk to be the same across all subproblems.
     """
-    def __init__(self, cobra_model, _id, solver='gurobi', weight=1.):
+    def __init__(self, cobra_model, _id, first_stage_vars=None, solver='gurobi', weight=1.):
         """
         """
         self._id = _id
         self.cobra_model = cobra_model
         self._weight = weight
-        A,B,d,dsenses,xs,ys,C,b,bsenses,mets_d,mets_b = split_cobra(cobra_model)
+        A,B,d,dsenses,xs,ys,C,b,bsenses,mets_d,mets_b = split_cobra(cobra_model, first_stage_vars)
         self._A = A
         self._Acsc = A.tocsc()
         self._B = B
@@ -1587,6 +1594,7 @@ class LagrangeSubmodel(object):
         self.yopt = None
         self.x_dict={}
         self.ObjVal = None
+        self.max_alt = None
 
         # self.model = self.init_model(xs, A, d, csenses)
         self.model = self.init_model()
@@ -1759,7 +1767,7 @@ class LagrangeMaster(object):
     Thus, D(u) - D(u0) <= (H*y0)'(u-u0).
     Therefore, H*y0 is a supergradient of D(.) at u0.
     """
-    def __init__(self, cobra_model, solver='gurobi', method='ld'):
+    def __init__(self, cobra_model, first_stage_vars=None, solver='gurobi', method='ld'):
         """
         Input
         method : 'lr' Lagrangean relaxation, 'ld' Lagrangean decomposition
@@ -1767,7 +1775,8 @@ class LagrangeMaster(object):
         self.cobra_model = cobra_model
         self.sub_dict = {}
         self.primal_dict={}
-        A,B,d,csenses,xs,ys,C,b,csenses_mp,mets_d,mets_b = split_cobra(cobra_model)
+        A,B,d,csenses,xs,ys,C,b,csenses_mp,mets_d,mets_b = split_cobra(
+                cobra_model,first_stage_vars)
         self._A = A
         self._Acsc = A.tocsc()
         self._B = B
@@ -2040,7 +2049,7 @@ class LagrangeMaster(object):
         return cut
 
     def optimize(self, feasible_method='enumerate', bundle=False, multicut=True,
-            max_alt=100, alt_method='pool', nogood_cuts=False):
+            max_alt=10, alt_method='pool', nogood_cuts=False):
         """
         x_dict = optimize()
 
@@ -2237,6 +2246,11 @@ class LagrangeMaster(object):
                                 if sum([abs(x) for x in sum(Hys)]) > feastol:
                                     print("WARNING: Non-anticipativity constraints not satisfied.")
                             #--------------------------------------------
+                            # Final Log
+                            toc = time.time()-tic
+                            self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
+                                'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
+                                'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
                             break
                     else:
                         if verbosity>0:
@@ -2247,6 +2261,10 @@ class LagrangeMaster(object):
             #----------------------------------------------------
             # Update delta in objective according to trust region update rule
             delta = max(delta_min, delta_mult*delta)
+            # delta = delta_mult*delta
+            # if delta <= delta_min:
+            #     delta = 0
+
             # Also update uk as per proximal point method
             u0 = uk     # update even if not better?
 
@@ -2277,16 +2295,21 @@ class LagrangeMaster(object):
         """
         model = self.model
         sub_dict = self.sub_dict
+        xtype_dict = {sub_ind:[x.VType for x in sub._xs] for sub_ind,sub in iteritems(sub_dict)}
         ytype_dict = {sub_ind:[y.VType for y in sub._ys] for sub_ind,sub in iteritems(sub_dict)}
         for sub in sub_dict.values():
             for y in sub._ys:
                 y.VType = GRB.CONTINUOUS
+            for x in sub._xs:
+                x.VType = GRB.CONTINUOUS
         x_dict = self.optimize(*args,**kwargs)
 
         # Make integer/binary again
         for sub_ind,sub in iteritems(sub_dict):
             for y,yt in zip(sub._ys,ytype_dict[sub_ind]):
                 y.VType = yt
+            for x,xt in zip(sub._xs,xtype_dict[sub_ind]):
+                x.VType = xt
 
         return x_dict
 
@@ -2316,7 +2339,7 @@ class LagrangeMaster(object):
 
         return cut
 
-    def enum_alt_opt(self, first_feasible=True, max_alt=100, method='pool', nogood_cuts=False):
+    def enum_alt_opt(self, first_feasible=True, max_alt=10, method='pool', nogood_cuts=False):
         """
         Enumerate solutions by adding integer cuts while keeping objective fixed.
 
@@ -2335,8 +2358,10 @@ class LagrangeMaster(object):
         if method=='pool':
             # Use solver feature to pool n best sols
             for sub_ind,sub in iteritems(sub_dict):
+                if sub.max_alt is None:
+                    sub.max_alt = max_alt
                 sub.model.Params.PoolSearchMode=2   # Keep n best sols
-                sub.model.Params.PoolSolutions = max_alt
+                sub.model.Params.PoolSolutions = sub.max_alt
                 sub.optimize()
                 bestobj = sub.ObjVal
 
@@ -2379,13 +2404,6 @@ class LagrangeMaster(object):
                                         opt_obj, tot_obj, sub.ObjVal,sub_ind))
                                     print("Alt optimum %d in subprob %s is feasible! Done."%(
                                         k, sub_ind))
-                                # Log final progress
-                                toc = time.time()-tic
-                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUBk,
-                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,
-                                    'delta':delta, 'res_u':res_u,
-                                    't_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-
                                 return yfeas, feasUBk, is_optimal
 
                     # Integer (no-good) cuts exclude alt opt infeasible points
@@ -2393,7 +2411,14 @@ class LagrangeMaster(object):
                         for yk in alt_sols:
                             self.add_int_cut(sub, yk)
                         if self.verbosity > 1:
-                            print("Excluded %d infeasible alt optima"%(len(alt_sols)))
+                            print("Excluded %d infeasible alt optima from sub %s"%(
+                                len(alt_sols), sub_ind))
+
+                    # Adpatively expand or shrink number of sols to keep for this sub
+                    if len(alt_sols)==sub.max_alt:
+                        sub.max_alt = 2*sub.max_alt
+                    else:
+                        sub.max_alt = len(alt_sols)
 
                 else:
                     if self.verbosity>1:
@@ -2456,7 +2481,7 @@ class LagrangeMaster(object):
                     # Enumerate alt optima
                     n_alt = 0
                     intcuts = []
-                    for icut in range(max_alt):
+                    for icut in range(sub.max_alt):
                         # Add int cut
                         intcut = self.add_int_cut(sub, [v.X for v in sub._ys])
                         intcuts.append(intcut)
@@ -2480,6 +2505,10 @@ class LagrangeMaster(object):
                                     print("Alt optima %d is feasible! Stopping."%n_alt)
                                     # print("Found feasible alt opt. Stopping.")
                                 break
+                    if n_alt == sub.max_alt:
+                        sub.max_alt = sub.max_alt*2
+                    else:
+                        sub.max_alt = n_alt
                     #------------------------------------------------
                     # Relax all the constraints for next outer iter
                     cons = model.getConstrByName(fixobj_id)
