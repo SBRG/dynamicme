@@ -1723,6 +1723,8 @@ class LagrangeMaster(object):
          sum_k uk = 0
          yk integer
 
+    If yk all binary, special Hk available.
+
     Lagrangean (dual) master problem:
 
     max  z - delta/2 ||u - u*||2
@@ -1845,7 +1847,8 @@ class LagrangeMaster(object):
         Add submodels.
         Inputs
         sub_dict : dict of LagrangeSubmodel objects
-        antic_method : nonanticipativity constraint method
+        antic_method : nonanticipativity constraint method.
+                       Ignored if determined that all y are binary--uses tighter formulation.
             'extra': xk-x = 0
             'stagger': x1=x2, ... xk-1=xk
             'asymmetric':x1=x2, x1=x3, ..., x1=xk   # Reported to be the best (Oliveira, 2013)
@@ -1869,86 +1872,106 @@ class LagrangeMaster(object):
         # Update non-anticipativity constraints using ALL submodels
         nsub = len(self.sub_dict.keys())
         ny = len(self._y0)
+        # Check if all binary
+        are_binary = [y.upper_bound<=1 for y in self._y0]
+        is_binary = np.all(are_binary)
+
         # Update us
         INF = self._INF
-        us = []
-        nsub_max = nsub
-        if antic_method in ['stagger','asymmetric']:
-            nsub_max=nsub-1
 
-        for k in range(nsub_max):
-            for j in range(ny):
-                vid = 'u_%d%d'%(k,j)
-                ukj = model.getVarByName(vid)
-                if ukj is None:
-                    # Multiplier for an equality constraint
-                    ukj = model.addVar(-INF,INF,0.,GRB.CONTINUOUS,vid)
-                us.append(ukj)
+        if is_binary:
+            us = [model.addVar(-INF,INF,0.,GRB.CONTINUOUS,'u_0%d'%j) for j in range(ny)]
+        else:
+            us = []
+            nsub_max = nsub
+            if antic_method in ['stagger','asymmetric']:
+                nsub_max=nsub-1
+            for k in range(nsub_max):
+                for j in range(ny):
+                    vid = 'u_%d%d'%(k,j)
+                    ukj = model.getVarByName(vid)
+                    if ukj is None:
+                        # Multiplier for an equality constraint
+                        ukj = model.addVar(-INF,INF,0.,GRB.CONTINUOUS,vid)
+                    us.append(ukj)
 
         self._us = us
         # sum_u = 0 constraint
-        uzero = model.getConstrByName('uzero')
-        if uzero is None:
-            uzero = model.addConstr(
-                    LinExpr(np.ones(len(us)),us) == 0, name='uzero')
-        else:
-            uzero.RHS = 0.
-            uzero.Sense = GRB.EQUAL
-            for u in us:
-                model.chgCoeff(uzero, u, 1.)
+        # uzero = model.getConstrByName('uzero')
+        # if uzero is None:
+        #     uzero = model.addConstr(
+        #             LinExpr(np.ones(len(us)),us) == 0, name='uzero')
+        # else:
+        #     uzero.RHS = 0.
+        #     uzero.Sense = GRB.EQUAL
+        #     for u in us:
+        #         model.chgCoeff(uzero, u, 1.)
 
-        # Each submodel's Hk: [ny*(K-1) x ny] matrix
-        Hm = ny*nsub_max
-        Hn = ny
-        if antic_method=='extra':
-            # Just identity matrix
+        # if y all binary, H1 = 1-p1*eye(n). H_{k>1}=-pk*eye(n)
+        # else each submodel's Hk: [ny*(K-1) x ny] matrix
+        weights = [sub._weight for sub in sub_dict.values()]
+        w_tot = sum(weights)
+
+        if is_binary:
             for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
-                data = np.ones(ny)
-                rows = np.arange(k*ny,(k+1)*ny)
-                cols = range(ny)
-                Hk = coo_matrix((data,(rows,cols)), shape=(Hm,Hn)).tocsr()
-                sub._H = Hk
-
-        elif antic_method=='stagger':
-            for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
-                if k < nsub-1:
-                    # Last set doesn't need self
-                    data_self = np.ones(ny).tolist()
-                    rows_self = np.arange(k*ny,(k+1)*ny).tolist() #range(ny) + k*ny
-                    cols_self = list(range(ny))
-                else:
-                    data_self = []
-                    rows_self = []
-                    cols_self = []
-                if k > 0:
-                    data_other= (-np.ones(ny)).tolist()
-                    rows_other= np.arange((k-1)*ny,k*ny).tolist() #range(ny) + (k-1)*ny
-                    cols_other= list(range(ny))
-                else:
-                    data_other= []
-                    rows_other= []
-                    cols_other= []
-
-                data = data_self + data_other
-                rows = rows_self + rows_other
-                cols = cols_self + cols_other
-
-                Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
-                sub._H = Hk
-
-        elif antic_method=='asymmetric':
-            for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+                p = sub._weight / w_tot
                 if k==0:
-                    data = np.ones(ny*nsub_max)
-                    rows = range(ny*nsub_max)
-                    cols = [ii for i in [range(ny) for kk in range(nsub_max)] for ii in i]
+                    Hk = (1-p)*identity(ny)
                 else:
-                    data= -np.ones(ny)
-                    rows= np.arange((k-1)*ny,k*ny)
-                    cols= range(ny)
-
-                Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
+                    Hk = -p*identity(ny)
                 sub._H = Hk
+        else:
+            Hm = ny*nsub_max
+            Hn = ny
+            if antic_method=='extra':
+                # Just identity matrix
+                for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+                    data = np.ones(ny)
+                    rows = np.arange(k*ny,(k+1)*ny)
+                    cols = range(ny)
+                    Hk = coo_matrix((data,(rows,cols)), shape=(Hm,Hn)).tocsr()
+                    sub._H = Hk
+
+            elif antic_method=='stagger':
+                for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+                    if k < nsub-1:
+                        # Last set doesn't need self
+                        data_self = np.ones(ny).tolist()
+                        rows_self = np.arange(k*ny,(k+1)*ny).tolist() #range(ny) + k*ny
+                        cols_self = list(range(ny))
+                    else:
+                        data_self = []
+                        rows_self = []
+                        cols_self = []
+                    if k > 0:
+                        data_other= (-np.ones(ny)).tolist()
+                        rows_other= np.arange((k-1)*ny,k*ny).tolist() #range(ny) + (k-1)*ny
+                        cols_other= list(range(ny))
+                    else:
+                        data_other= []
+                        rows_other= []
+                        cols_other= []
+
+                    data = data_self + data_other
+                    rows = rows_self + rows_other
+                    cols = cols_self + cols_other
+
+                    Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
+                    sub._H = Hk
+
+            elif antic_method=='asymmetric':
+                for k,(sub_ind,sub) in enumerate(iteritems(sub_dict)):
+                    if k==0:
+                        data = np.ones(ny*nsub_max)
+                        rows = range(ny*nsub_max)
+                        cols = [ii for i in [range(ny) for kk in range(nsub_max)] for ii in i]
+                    else:
+                        data= -np.ones(ny)
+                        rows= np.arange((k-1)*ny,k*ny)
+                        cols= range(ny)
+
+                    Hk = coo_matrix((data, (rows, cols)), shape=(Hm,Hn)).tocsr()
+                    sub._H = Hk
 
 
         self.update_obj()
@@ -2079,6 +2102,7 @@ class LagrangeMaster(object):
         u0 = np.zeros(nu)   # Trust region center
         ubest = uk
         x_dict = {}
+        self.log_rows = []
 
         status_dict[GRB.SUBOPTIMAL] = 'suboptimal'
         status_dict[GRB.NUMERIC] = 'numeric'
@@ -2089,7 +2113,7 @@ class LagrangeMaster(object):
         print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
             '-'*7,'-'*19,'-'*19,'-'*9,'-'*9,'-'*9,'-'*29))
         print("%8.6s%11.8s%11.8s%11.8s%11.8s%10.8s%10.8s%10.8s%10.8s%10.8s%10.8s" % (
-            '','Dual','Best','Sub','Best','','','','total','master','sub'))
+            '','Best','Feasible','Sub','Best','','','','total','master','sub'))
 
         # Don't pool solutions until gap below tolerance
         for sub in sub_dict.values():
@@ -2169,13 +2193,20 @@ class LagrangeMaster(object):
                 gap = 0.
             relgap = gap/(1e-10+abs(bestUB))
             res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
+            #------------------------------------------------
+            # Log progress
+            toc = time.time()-tic
+            self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
+                'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
+                'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
+            #------------------------------------------------
             if relgap <= gaptol and abs(res_u)<penaltytol:
                 #--------------------------------------------
                 toc = time.time()-tic
                 if verbosity>0:
                     print(
                     "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                    _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
+                    _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
                 #--------------------------------------------
                 # Now, look for a feasible solution
                 if feasible_method is not None:
@@ -2224,8 +2255,7 @@ class LagrangeMaster(object):
                 if verbosity>0:
                     print(
                     "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                    _iter,dualUB,bestUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
-
+                    _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
             # Check timelimit
             toc = time.time()-tic
             if toc > time_limit:
@@ -2349,6 +2379,13 @@ class LagrangeMaster(object):
                                         opt_obj, tot_obj, sub.ObjVal,sub_ind))
                                     print("Alt optimum %d in subprob %s is feasible! Done."%(
                                         k, sub_ind))
+                                # Log final progress
+                                toc = time.time()-tic
+                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUBk,
+                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,
+                                    'delta':delta, 'res_u':res_u,
+                                    't_total':toc,'t_master':toc_master,'t_sub':toc_sub})
+
                                 return yfeas, feasUBk, is_optimal
 
                     # Integer (no-good) cuts exclude alt opt infeasible points
