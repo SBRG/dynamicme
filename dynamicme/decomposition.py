@@ -2048,8 +2048,8 @@ class LagrangeMaster(object):
 
         return cut
 
-    def optimize(self, feasible_method='enumerate', bundle=False, multicut=True,
-            max_alt=10, alt_method='pool', nogood_cuts=False):
+    def optimize(self, feasible_methods=['heuristic','enumerate'], bundle=False,
+            multicut=True, max_alt=10, alt_method='pool', nogood_cuts=False):
         """
         x_dict = optimize()
 
@@ -2063,9 +2063,10 @@ class LagrangeMaster(object):
         6) Solve Lagrange dual problem: u(k+1). Goto 1)
 
         Inputs
-        feasible_method : method to construct feasible solution
+        feasible_methods :methods to construct feasible solution
                           for complicating (integer) variables.
-                          - heuristic (default) : use heuristic
+                          - heuristic : use heuristic
+                          - enumerate : enumerate alternate optima
                           - benders : Benders' decomposition, making overall
                             procedure a cross-decomposition.
         bundle : if True, only update uk-->wk+1 if
@@ -2092,6 +2093,9 @@ class LagrangeMaster(object):
         delta_min = self.delta_min
         delta_mult= self.delta_mult
         delta = 1.
+
+        if feasible_methods is None:
+            feasible_methods = []
 
         z = self._z
         us = self._us
@@ -2158,7 +2162,7 @@ class LagrangeMaster(object):
             for sub_ind,sub in iteritems(sub_dict):
                 sub.update_obj(uk)
                 #********************************************
-                obj = sub.optimize(yk=sub.yopt)
+                obj = sub.optimize(yk=sub.yopt) * sub._weight
                 #********************************************
                 sub_objs.append(obj)
                 if sub.model.Status == GRB.OPTIMAL:
@@ -2218,43 +2222,83 @@ class LagrangeMaster(object):
                     _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
                 #--------------------------------------------
                 # Now, look for a feasible solution
-                if feasible_method is not None:
-                    yfeas, feasUBk, is_optimal = self.enum_alt_opt(first_feasible=True,
-                            max_alt=max_alt, method=alt_method, nogood_cuts=nogood_cuts)
-                    if yfeas is not None:
-                        #--------------------------------------------
-                        # Final solution candidate
-                        if feasUBk < feasUB:
-                            feasUB = feasUBk
-                            ybest = yfeas
-                            self.yopt = ybest
-                            for j,yj in enumerate(ybest):
-                                x_dict[sub._ys[j].VarName] = yj
-                            if verbosity>1:
-                                print("Best feasible solution has objval=%s"%(feasUB))
+                # Spend user-defined portion of total time on different strategies,
+                # including heuristics, B&B, and enumeration.
+                #--------------------------------------------
+                if feasible_methods:
+                    if 'heuristic' in feasible_methods:
+                        yfeas, feasUBk, is_optimal = self.feasible_heuristics('average')
+                        if yfeas is not None:
+                            if feasUBk < feasUB:
+                                feasUB = feasUBk
+                                ybest = yfeas
+                                self.yopt = ybest
+                                for j,yj in enumerate(ybest):
+                                    x_dict[sub._ys[j].VarName] = yj
+                                if verbosity>1:
+                                    print("Best Heuristic solution has objval=%s"%(feasUB))
 
-                        if is_optimal:
+                            if is_optimal:
+                                #--------------------------------------------
+                                # Final QC that sum_k Hk*yk = 0
+                                Hys = []
+                                for sub_ind,sub in iteritems(sub_dict):
+                                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
+                                    Hyk = sub._H*yk
+                                    Hys.append(Hyk)
+                                if verbosity>1:
+                                    print("sum_k Hk*yk: %s"%(sum(Hys)))
+                                    if sum([abs(x) for x in sum(Hys)]) > feastol:
+                                        print("WARNING: Non-anticipativity constraints not satisfied.")
+                                #--------------------------------------------
+                                # Final Log
+                                toc = time.time()-tic
+                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
+                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
+                                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
+                                break
+
+                    # Move on to the next primal recovery method
+                    if 'enumerate' in feasible_methods:
+                        yfeas, feasUBk, is_optimal = self.enum_alt_opt(first_feasible=True,
+                                max_alt=max_alt, method=alt_method, nogood_cuts=nogood_cuts)
+                        if yfeas is not None:
                             #--------------------------------------------
-                            # Final QC that sum_k Hk*yk = 0
-                            Hys = []
-                            for sub_ind,sub in iteritems(sub_dict):
-                                yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
-                                Hyk = sub._H*yk
-                                Hys.append(Hyk)
-                            if verbosity>1:
-                                print("sum_k Hk*yk: %s"%(sum(Hys)))
-                                if sum([abs(x) for x in sum(Hys)]) > feastol:
-                                    print("WARNING: Non-anticipativity constraints not satisfied.")
-                            #--------------------------------------------
-                            # Final Log
-                            toc = time.time()-tic
-                            self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
-                                'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
-                                'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-                            break
-                    else:
-                        if verbosity>0:
-                            print("Feasible solution not among alt opt. Trying next iteration.")
+                            # Final solution candidate
+                            if feasUBk < feasUB:
+                                feasUB = feasUBk
+                                ybest = yfeas
+                                self.yopt = ybest
+                                for j,yj in enumerate(ybest):
+                                    x_dict[sub._ys[j].VarName] = yj
+                                if verbosity>1:
+                                    print("Best feasible solution has objval=%s"%(feasUB))
+
+                            if is_optimal:
+                                #--------------------------------------------
+                                # Final QC that sum_k Hk*yk = 0
+                                Hys = []
+                                for sub_ind,sub in iteritems(sub_dict):
+                                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
+                                    Hyk = sub._H*yk
+                                    Hys.append(Hyk)
+                                if verbosity>1:
+                                    print("sum_k Hk*yk: %s"%(sum(Hys)))
+                                    if sum([abs(x) for x in sum(Hys)]) > feastol:
+                                        print("WARNING: Non-anticipativity constraints not satisfied.")
+                                #--------------------------------------------
+                                # Final Log
+                                toc = time.time()-tic
+                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
+                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
+                                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
+                                break
+                        else:
+                            if verbosity>0:
+                                print("Feasible solution not among alt opt. Trying next iteration.")
+                    #--------------------------------------------
+                    # END: Recover primal feasible solution.
+                    #--------------------------------------------
                 else:
                     break
 
@@ -2523,6 +2567,37 @@ class LagrangeMaster(object):
                     model.update()
 
         return yfeas, feasUBk, is_optimal
+
+
+    def feasible_heuristics(self, heuristic='average'):
+        """
+        Lagrangian heuristics for feasible primal recovery.
+        """
+        yfeas = None
+        feasUB = None
+        is_optimal = False
+
+        sub_dict = self.sub_dict
+        opt_obj = sum([sub.ObjVal for sub in sub_dict.values()])
+
+        if heuristic=='average':
+            ymat = np.array([[sub._weight*v.X for v in sub._ys] for sub in sub_dict.values()])
+            y0 = ymat.mean(axis=0).round()
+            obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+
+            are_feas = feas_dict.values()
+            tot_obj = sum(obj_dict.values())
+            gap = abs(tot_obj-opt_obj)
+            relgap = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj))
+            is_optimal = gap <= self.absgaptol or relgap <= self.gaptol
+
+            if np.all(are_feas):
+                yfeas = y0
+                feasUB = tot_obj
+        else:
+            print("Unknown heuristic: %s"%heuristic)
+
+        return yfeas, feasUB, is_optimal
 
 
     def make_feasible(self, feasible_method='enumerate', alt_method='pool', max_alt=100,
