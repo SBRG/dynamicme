@@ -212,6 +212,8 @@ class RadixEstimator(Estimator):
             reset_obj=True):
         """
         Make objective function of type objective.
+        Inputs
+        objective : 'minerr', 'minsse'
         """
         INF = self._INF
         stacker = self.stacker

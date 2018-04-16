@@ -1805,6 +1805,7 @@ class LagrangeMaster(object):
         self.delta_min = 1e-10
         self.delta_mult = 0.5
         self.bundle_mult = 0.5
+        self.max_max_alt = 200
         self.x_dict = {}
         self.yopt = None
 
@@ -2404,21 +2405,39 @@ class LagrangeMaster(object):
 
             # Is the new approximated max D(uk+1) better enough to warrant
             # updating proximal point?
-            pred_descent = z.X - D_prox     # Should always be better or the same
+            pred_ascent = z.X - D_prox     # Should always be better or the same
 
+            #************************************************
             if verbosity>2:
-                print("pred_descent=%s. Updating D_prox from %s to %s."%(
-                    pred_descent,D_prox,D_new))
-            if D_new >= (D_prox + bundle_mult*pred_descent):
-                if verbosity>1:
-                    print("pred_descent=%s. Updating D_prox from %s to %s."%(
-                        pred_descent,D_prox,D_new))
-                # Update proximal point
-                u0 = uk
-                # Compute Lagrangian at updated prox point
-                D_prox = self.solve_lagrangian(u0)
+                print("pred_ascent=%s. Updating D_prox from %s to %s."%(
+                    pred_ascent,D_prox,D_new))
+            #************************************************
+
+            ascent_tol = self.feastol
+            if abs(pred_ascent) < ascent_tol:
+                print("Master ascent of %s < %s  below threshold. Stopping."%(
+                    pred_ascent, ascent_tol))
+                toc = time.time()-tic
+                # Final Log
+                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
+                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
+                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
+                if verbosity>0:
+                    print(
+                    "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                    _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
+                break
             else:
-                pass
+                if D_new >= (D_prox + bundle_mult*pred_ascent):
+                    if verbosity>1:
+                        print("pred_ascent=%s. Updating D_prox from %s to %s."%(
+                            pred_ascent,D_prox,D_new))
+                    # Update proximal point
+                    u0 = uk
+                    # Compute Lagrangian at updated prox point
+                    D_prox = self.solve_lagrangian(u0)
+                else:
+                    pass
 
             delta = max(delta_min, delta_mult*delta)
             #------------------------------------------------
@@ -2543,7 +2562,7 @@ class LagrangeMaster(object):
                         gap = abs(tot_obj-opt_obj)
                         relgap = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj))
 
-                        is_optimal = gap <= self.absgaptol or relgap <= self.gaptol
+                        is_optimal = (gap <= self.absgaptol) or (relgap <= self.gaptol)
                         stats = np.array(sub_stats.values())
                         stat_dict[sub_ind] = stats
 
@@ -2571,7 +2590,7 @@ class LagrangeMaster(object):
 
                     # Adpatively expand or shrink number of sols to keep for this sub
                     if len(alt_sols)==sub.max_alt:
-                        sub.max_alt = 2*sub.max_alt
+                        sub.max_alt = min(2*sub.max_alt, self.max_max_alt)
                     else:
                         sub.max_alt = len(alt_sols)
 
