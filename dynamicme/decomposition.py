@@ -1804,6 +1804,7 @@ class LagrangeMaster(object):
         self.max_iter = 1e6
         self.delta_min = 1e-10
         self.delta_mult = 0.5
+        self.bundle_mult = 0.5
         self.x_dict = {}
         self.yopt = None
 
@@ -2048,8 +2049,31 @@ class LagrangeMaster(object):
 
         return cut
 
+    def solve_lagrangian(self, uk):
+        """
+        Solve Lagrangian given Lagrange multipliers
+        """
+        sub_dict = self.sub_dict
+        sub_objs = []
+        for sub_ind,sub in iteritems(sub_dict):
+            sub.update_obj(uk)
+            #********************************************
+            obj = sub.optimize(yk=sub.yopt) * sub._weight
+            #********************************************
+            sub_objs.append(obj)
+            if sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+                if verbosity>0:
+                    print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
+                        sub_ind, status_dict[sub.model.Status], sub.model.Status))
+                return None
+
+        objval = sum(sub_objs)
+        return objval
+
+
     def optimize(self, feasible_methods=['heuristic','enumerate'], bundle=False,
-            multicut=True, max_alt=10, alt_method='pool', nogood_cuts=False):
+            multicut=True, max_alt=10, alt_method='pool', nogood_cuts=False,
+            early_heuristics=[]):
         """
         x_dict = optimize()
 
@@ -2093,6 +2117,8 @@ class LagrangeMaster(object):
         delta_min = self.delta_min
         delta_mult= self.delta_mult
         delta = 1.
+        bundle_mult = self.bundle_mult
+        D_prox = None    # proximal point objval
 
         if feasible_methods is None:
             feasible_methods = []
@@ -2189,7 +2215,9 @@ class LagrangeMaster(object):
             # Compute UB
             UB = z.X        # Lagrange dual UB
             dualUB = UB
-            bestUB = UB
+            # if UB < bestUB:
+            #     bestUB = UB
+            bestUB = UB     # Since proximal penalty might bias it
             #----------------------------------------------------
             # Update bounds and check convergence
             LB = sum(sub_objs)
@@ -2198,6 +2226,47 @@ class LagrangeMaster(object):
                 ubest  = uk     # Record best multipliers that improved LB
                 self.uopt = ubest
                 self.x_dict = {v.VarName:v.X for v in model.getVars()}
+            #----------------------------------------------------
+            # Can use Heuristics before desired gap reached
+            if early_heuristics:
+                for heuristic in early_heuristics:
+                    yfeas, feasUBk, is_optimal = self.feasible_heuristics(heuristic)
+                    if yfeas is not None:
+                        if feasUBk < bestUB:
+                            bestUB = feasUBk
+                        if feasUBk < feasUB:
+                            feasUB = feasUBk
+                            ybest = yfeas
+                            self.yopt = ybest
+                            for j,yj in enumerate(ybest):
+                                x_dict[sub._ys[j].VarName] = yj
+                            if verbosity>1:
+                                print("Best Heuristic solution has objval=%s"%(feasUB))
+                            gap = abs(bestUB-bestLB)
+                            if abs(gap)<absgaptol:
+                                gap = 0.
+                            relgap = gap/(1e-10+abs(bestUB))
+                            if relgap <= gaptol:
+                                #--------------------------------------------
+                                # Final QC that sum_k Hk*yk = 0
+                                Hys = []
+                                for sub_ind,sub in iteritems(sub_dict):
+                                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
+                                    Hyk = sub._H*yk
+                                    Hys.append(Hyk)
+                                if verbosity>1:
+                                    print("sum_k Hk*yk: %s"%(sum(Hys)))
+                                    if sum([abs(x) for x in sum(Hys)]) > feastol:
+                                        print("WARNING: Non-anticipativity constraints not satisfied.")
+                                #--------------------------------------------
+                                # Final Log
+                                toc = time.time()-tic
+                                res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
+                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
+                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
+                                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
+                                break
+
 
             # Quadratic stabilization term can cause "best" LB and UB to change
             # non monotonically, not guaranteeing bestUB > bestLB
@@ -2213,6 +2282,7 @@ class LagrangeMaster(object):
                 'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
                 'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
             #------------------------------------------------
+
             if relgap <= gaptol and abs(res_u)<penaltytol:
                 #--------------------------------------------
                 toc = time.time()-tic
@@ -2303,14 +2373,55 @@ class LagrangeMaster(object):
                     break
 
             #----------------------------------------------------
-            # Update delta in objective according to trust region update rule
-            delta = max(delta_min, delta_mult*delta)
-            # delta = delta_mult*delta
-            # if delta <= delta_min:
-            #     delta = 0
+            """
+            Proximal bundle for minimizing convex function D(u) given
+            we can compute D(u) and subgradient g(u) at u in U,
+            and polyhedral lower approximation,
+            _Dk(u) = max_j {D(uj) + <g(uj), u-uj>}.
 
-            # Also update uk as per proximal point method
-            u0 = uk     # update even if not better?
+            Next trial point uk+1 is
+            uk+1 \in arg min {_Dk(u) + 1/2*ck*||u-uc||^2: u \in U}.
+            Descent step to xk+1 = yk+1 if
+
+            D(uk+1) >= D(uc) + a*vk,
+
+            else uk+1 = uk,
+            where a \in (0,1) fixed and
+
+            vk = _Dk(uk+1) - D(uc) >= 0,
+
+            I.e., check if
+            D(uk+1) - D(uc) >= a*( _Dk(uk+1) - D(uc) )
+
+            if vk = 0 then uk is optimal.
+            Here:
+            D(u) is the Lagrangian at u
+            _Dk(u) is the lower polyhedral approximation of Lagrangian D(u)
+            """
+            D_new  = LB
+            if D_prox is None:
+                D_prox = self.solve_lagrangian(u0)
+
+            # Is the new approximated max D(uk+1) better enough to warrant
+            # updating proximal point?
+            pred_descent = z.X - D_prox     # Should always be better or the same
+
+            if verbosity>2:
+                print("pred_descent=%s. Updating D_prox from %s to %s."%(
+                    pred_descent,D_prox,D_new))
+            if D_new >= (D_prox + bundle_mult*pred_descent):
+                if verbosity>1:
+                    print("pred_descent=%s. Updating D_prox from %s to %s."%(
+                        pred_descent,D_prox,D_new))
+                # Update proximal point
+                u0 = uk
+                # Compute Lagrangian at updated prox point
+                D_prox = self.solve_lagrangian(u0)
+            else:
+                pass
+
+            delta = max(delta_min, delta_mult*delta)
+            #------------------------------------------------
 
             if np.mod(_iter, print_iter)==0:
                 toc = time.time()-tic
@@ -2581,7 +2692,8 @@ class LagrangeMaster(object):
         opt_obj = sum([sub.ObjVal for sub in sub_dict.values()])
 
         if heuristic=='average':
-            ymat = np.array([[sub._weight*v.X for v in sub._ys] for sub in sub_dict.values()])
+            ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for 
+                sub in sub_dict.values()])
             y0 = ymat.mean(axis=0).round()
             obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
 
