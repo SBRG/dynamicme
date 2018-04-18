@@ -2472,6 +2472,11 @@ class LagrangeMaster(object):
 
         return x_dict
 
+    def restore_feasible(self):
+        """
+        Restore primal feasible solution.
+        """
+
     def solve_relaxed(self,*args,**kwargs):
         """
         Solve LP relaxation.
@@ -2544,7 +2549,7 @@ class LagrangeMaster(object):
                 if sub.max_alt is None:
                     sub.max_alt = max_alt
                 sub.model.Params.PoolSearchMode=2   # Keep n best sols
-                sub.model.Params.PoolSolutions = sub.max_alt
+                sub.model.Params.PoolSolutions = max(1,sub.max_alt)
                 sub.optimize()
                 bestobj = sub.ObjVal
 
@@ -2601,7 +2606,7 @@ class LagrangeMaster(object):
                     if len(alt_sols)==sub.max_alt:
                         sub.max_alt = min(2*sub.max_alt, self.max_max_alt)
                     else:
-                        sub.max_alt = len(alt_sols)
+                        sub.max_alt = max(1,len(alt_sols))
 
                 else:
                     if self.verbosity>1:
@@ -2609,12 +2614,15 @@ class LagrangeMaster(object):
                     break
             #----------------------------------------
             # Save best feasible so far
-            feasUBk = min(feas_objs)
-            yfeas   = feas_sols[feas_objs.index(feasUBk)]
-            if self.verbosity > 1:
-                print("Best feasible solution among %d alt feasible has objval=%s"%(
-                    len(feas_sols), feasUBk))
-
+            if len(feas_objs)>0:
+                feasUBk = min(feas_objs)
+                yfeas   = feas_sols[feas_objs.index(feasUBk)]
+                if self.verbosity > 1:
+                    print("Best feasible solution among %d alt feasible has objval=%s"%(
+                        len(feas_sols), feasUBk))
+            else:
+                if self.verbosity>1:
+                    print("No feasible solution enumerated.")
         else:
             fixobj_id = 'fixobjval'
             if self.verbosity>1:
