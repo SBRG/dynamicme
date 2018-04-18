@@ -15,6 +15,7 @@ from cobra.core.Solution import Solution
 from cobra import Reaction, Metabolite, Model
 from cobra import DictList
 from generate import copy_model
+from scipy.sparse import dok_matrix
 
 import numpy as np
 import cobra
@@ -32,7 +33,9 @@ for api in solver_apis:
         globals()[api] = lib
 
 class Variable(Reaction):
-    pass
+    def __init__(self, *args, **kwargs):
+        self.quadratic_coeff = None
+        super(Variable, self).__init__(*args, **kwargs)
 
 class Constraint(Metabolite):
     pass
@@ -673,6 +676,7 @@ class StackOptimizer(object):
     def __init__(self):
         self.model_dict = {}
         self.model = None
+        self.Q = None
 
     def update(self):
         """
@@ -680,6 +684,8 @@ class StackOptimizer(object):
         """
         for k,mdl in iteritems(self.model_dict):
             pass
+
+        self.update_quadratic_objective()
 
 
     def stack_models(self, mdl_ref, df_conds, col_ind='cond'):
@@ -710,6 +716,28 @@ class StackOptimizer(object):
             self.model_dict[cond] = mdli
 
         self.model = stacked_model
+
+    def update_quadratic_objective(self):
+        # Create/update quadratic component
+        model = self.model
+        Q_inds = []
+        for rxn in model.reactions:
+            if hasattr(rxn, 'quadratic_coeff'):
+                if rxn.quadratic_coeff is not None:
+                    ind = model.reactions.index(rxn)
+                    Q_inds.append((ind,rxn.quadratic_coeff))
+
+        if len(Q_inds)>0:
+            N = len(model.reactions)
+            Q = dok_matrix((N,N))
+            for ind_coeff in Q_inds:
+                ind = ind_coeff[0]
+                coeff = ind_coeff[1]
+                Q[ind,ind] = coeff
+        else:
+            Q = None
+
+        self.Q = Q
 
 
 class SplitOptimizer(object):

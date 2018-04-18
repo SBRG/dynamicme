@@ -62,7 +62,6 @@ class RadixEstimator(Estimator):
         self.digits = None
         self.kfit_dict = None
         self.col_ind = None
-        self.stacker = None
 
 
     def fit(self, base_model, df_X, df_Y, **kwargs):
@@ -179,7 +178,8 @@ class RadixEstimator(Estimator):
         # self.optimize(solver=solver)
         #----------------------------------------------------
         if solver=='gurobi':
-            milp = gurobi_solver.create_problem(stacker.model)
+            Q = stacker.Q
+            milp = gurobi_solver.create_problem(stacker.model, quadratic_component=Q)
             milp.ModelSense = grb.GRB.MINIMIZE
             milp.Params.IntFeasTol = 1e-9
             milp.Params.OutputFlag = 1
@@ -258,6 +258,47 @@ class RadixEstimator(Estimator):
                             y.objective_coefficient=0.
                         else:
                             y.objective_coefficient=reg_weight
+        elif objective == 'minsse':
+            """
+            Min SSE:
+            e = mu - mu0
+            e - mu = -mu0
+            1/2 * sum_k wk*e^2
+            """
+            for mdl_ind,mdl in iteritems(model_dict):
+                if reset_obj:
+                    for rxn in mdl.reactions:
+                        rxn.objective_coefficient = 0.
+                dfi = df_meas[ df_meas[col_ind]==mdl_ind]
+                for rind,row in dfi.iterrows():
+                    x_meas = row[col_meas_val]
+                    meas_id = row[col_meas_id]
+                    rxn_meas = mdl.reactions.get_by_id(meas_id+"_%s"%mdl_ind)
+
+                    err = Variable('err_%s'%mdl_ind, lower_bound=-INF, upper_bound=INF)
+                    cons = Constraint('squared_err_%s'%mdl_ind)
+                    cons._constraint_sense = 'E'
+                    cons._bound = -x_meas
+                    mdl.add_metabolites(cons)
+                    mdl.add_reaction(err)
+                    err.add_metabolites({cons:1.})
+                    rxn_meas.add_metabolites({cons:-1.})
+                    weight = (1.-reg_weight)/(abs(x_meas) + 1)
+                    err.quadratic_coeff = weight
+
+            stacker.update_quadratic_objective()
+
+            for group_id in var_cons_dict.keys():
+                for l,pwr in enumerate(powers):
+                    for k,digit in enumerate(digits):
+                        yid = 'binary_%s%s%s'%(group_id,k,l)
+                        y   = stacker.model.reactions.get_by_id(yid)
+                        # Prefer pwr=0, digit=1
+                        if pwr==0 and digit==1:
+                            y.objective_coefficient=0.
+                        else:
+                            y.objective_coefficient=reg_weight
+
         elif objective == 'sparse':
             for mdl_ind,mdl in iteritems(model_dict):
                 if reset_obj:

@@ -1570,7 +1570,8 @@ class LagrangeSubmodel(object):
     where uk are Lagrange multipliers updated by Lagrangean master problem,
     and Hk constrain yk to be the same across all subproblems.
     """
-    def __init__(self, cobra_model, _id, first_stage_vars=None, solver='gurobi', weight=1.):
+    def __init__(self, cobra_model, _id, first_stage_vars=None, solver='gurobi', weight=1.,
+            Q=None):
         """
         """
         self._id = _id
@@ -1591,6 +1592,7 @@ class LagrangeSubmodel(object):
         self._mets_d = mets_d
         self._mets_b = mets_b
         self._H = None
+        self._Q  = Q
         self.yopt = None
         self.x_dict={}
         self.ObjVal = None
@@ -1658,19 +1660,30 @@ class LagrangeSubmodel(object):
 
     def update_obj(self, uk):
         """
-        min  f'yk + c'xk + uk'*Hk*yk
+        min  f'yk + c'xk + uk'*Hk*yk + 1/2 x'*Q*x
         """
         ys = self._ys
         xs = self._xs
         fy = self._fy
         cx = self._cx
         Hk = self._H
+        Q = self._Q
 
         uH = uk*Hk
 
         model = self.model
+        obj_lin = LinExpr(fy,ys) + LinExpr(cx,xs) + LinExpr(uH,ys)
+        if Q is None:
+            obj_fun = obj_lin
+        else:
+            var_dict = {i:v for i,v in enumerate(model.getVars())}
+            obj_quad = grb.QuadExpr()
+            for (ind0,ind1),val in Q.todok().items():
+                x0 = var_dict[ind0]
+                x1 = var_dict[ind1]
+                obj_quad.addTerms(val/2., x0, x1)
+            obj_fun = obj_lin + obj_quad
 
-        obj_fun = LinExpr(fy,ys) + LinExpr(cx,xs) + LinExpr(uH,ys)
         model.setObjective(obj_fun, GRB.MINIMIZE)
         model.update()
 
@@ -1907,16 +1920,6 @@ class LagrangeMaster(object):
                     us.append(ukj)
 
         self._us = us
-        # sum_u = 0 constraint
-        # uzero = model.getConstrByName('uzero')
-        # if uzero is None:
-        #     uzero = model.addConstr(
-        #             LinExpr(np.ones(len(us)),us) == 0, name='uzero')
-        # else:
-        #     uzero.RHS = 0.
-        #     uzero.Sense = GRB.EQUAL
-        #     for u in us:
-        #         model.chgCoeff(uzero, u, 1.)
 
         # if y all binary, H1 = 1-p1*eye(n). H_{k>1}=-pk*eye(n)
         # else each submodel's Hk: [ny*(K-1) x ny] matrix
@@ -2016,20 +2019,26 @@ class LagrangeMaster(object):
         """
         Make supergradient cut for subproblem k:
 
-        tk <= f'yk + c'xk + u*Hk*yk
+        tk <= f'yk + c'xk + 1/2 x'*Q*x + u*Hk*yk
         Hk = [ny*(K-1) x ny] matrix
         """
         tk  = self.model.getVarByName('tk_%s'%sub._id)
         fy  = sub._fy
         cx  = sub._cx
         Hk  = sub._H
+        Q   = sub._Q
         xk = np.array([sub.x_dict[v.VarName] for v in sub._xs])
         yk = np.array([sub.x_dict[v.VarName] for v in sub._ys])
 
         yH  = Hk*yk
         us  = self._us
+        if Q is None:
+            quadTerm = 0.
+        else:
+            vk = np.array([sub.x_dict[v.VarName] for v in sub.model.getVars()])
+            quadTerm = 0.5*np.dot((Q*vk), vk)
         try:
-            cut = tk <= sum(fy*yk) + sum(cx*xk) + LinExpr(yH,us)
+            cut = tk <= sum(fy*yk) + sum(cx*xk) + LinExpr(yH,us) + quadTerm
         except GurobiError as e:
             print('Caught GurobiError (%s) in make_supercut()'%repr(e))
 
