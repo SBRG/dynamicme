@@ -75,6 +75,7 @@ class LocateMM(object):
         if len(self.model_dict)==0:
             self.stack_models()
         model_dict = self.model_dict
+        model = self.model
 
         df_location = self.df_location
         df_source   = self.df_source
@@ -90,40 +91,45 @@ class LocateMM(object):
         col_dist= self.col_dist
 
         Tc = self.Tc        # Flush cycle. Period available for cell division.
+        # Organisms
+        org_ids = df_organism[col_org].unique()
         # Locations
         J = np.union1d(df_location['i'], df_location['j'])
+        for mdl_id,mdl in iteritems(model_dict):
+            ykj = [Variable('y_%s'%(mdl_id), lower_bound=0, upper_bound=1)]
+            for yj in ykj:
+                yj.variable_kind = 'integer'
+            mdl.add_reactions(ykj)
+
         for _i,row in df_organism.iterrows():
-            mdl_id = row['id']
+            org_id = row['id']
             X0     = row['X0']
             j0     = row['j0']
             mu_id  = row['biomass']
-            mdl    = model_dict[mdl_id]
-            rxn_mu = mdl.reactions.get_by_id(mu_id)
-
-            yjk = [Variable('y_%s'%(j), lower_bound=0, upper_bound=1) for j in J]
-            for yj in yjk:
-                yj.variable_kind = 'integer'
-            mdl.add_reactions(yjk)
 
             # ADD: sum_j ykj - Xk0*muk*Tc <= Xk0 
-            cons = Constraint('cons_biomass')
-            cons._bound = X0
-            cons._constraint_sense = 'L'
-            rxn_mu.add_metabolites({cons:-X0*Tc}, combine=False)
-            for yj in yjk:
-                yj.add_metabolites({cons:1.}, combine=False)
+            cons_bio = Constraint('cons_biomass_%s'%org_id)
+            cons_bio._bound = X0
+            cons_bio._constraint_sense = 'L'
+            for yj in ykj:
+                yj.add_metabolites({cons_bio:1.}, combine=False)
 
-            # ADD: lkj*ykj <= vkj <= ukj*yjk
+            # ADD: lkj*ykj <= vkj <= ukj*ykj
             for locj in J:
-                yj = mdl.reactions.get_by_id('y_%s'%(locj))
+                mdl    = model_dict["%s_%s"%(org_id, locj)]
+                rxn_mu = mdl.reactions.get_by_id("%s_%s_%s"%(mu_id, org_id, locj))
+                rxn_mu.add_metabolites({cons_bio:-X0*Tc}, combine=False)
+
+                yj = model.reactions.get_by_id('y_%s_%s'%(org_id, locj))
+
                 for rxn in mdl.reactions:
-                    cons_lb = Constraint('binary_lb_%s'%rxn.id)
+                    cons_lb = Constraint('binary_lb_%s_%s_%s'%(rxn.id, org_id, locj))
                     cons_lb._bound = 0.
                     cons_lb._constraint_sense = 'L'
                     rxn.add_metabolites({cons_lb:-1.}, combine=False)
                     yj.add_metabolites({cons_lb:rxn.lower_bound}, combine=False)
 
-                    cons_ub = Constraint('binary_ub_%s'%rxn.id)
+                    cons_ub = Constraint('binary_ub_%s_%s_%s'%(rxn.id, org_id, locj))
                     cons_ub._bound = 0.
                     cons_ub._constraint_sense = 'L'
                     rxn.add_metabolites({cons_ub:1.}, combine=False)
@@ -131,39 +137,56 @@ class LocateMM(object):
 
         #----------------------------------------------------
         # Inter-model linking constraints
+        nutrients = df_nutrient[col_nutr].unique()
+        df_nutr_src = pd.merge(df_nutrient, df_source, on=col_src)
+
         for locj in J:
             # ADD: sum_k ykj <= 1, j \in Locations
-            cons_y = Constraint('cons_overlap_%s'%locj)
+            cons_y = Constraint('cons_overlap_%s'%locj) # Only in the stacked model
             cons_y._bound = 1.
             cons_y._constraint_sense = 'L'
             model.add_metabolites([cons_y])
-            for mdl_id,mdl in iteritems(model_dict):
-                yjk = mdl.reactions.get_by_id('binary_%s'%(locj))
-                yjk.add_metabolites({cons_y:1.}, combine=False)
+            for org_id in org_ids:
+                ykj = model.reactions.get_by_id('y_%s_%s'%(org_id, locj))
+                ykj.add_metabolites({cons_y:1.}, combine=False)
 
             # ADD: vklj >= sum_i vtot_lij/dij + sum_{p!=j} vsynth_lp/djp,  l \in Nutrients, j\in J
             #      vklj - sum_{p!=j} vsynth_lp/djp >= sum_i vtot_lij/dij,  l \in Nutrients, j\in J
-            nutrients = df_nutrient[col_nutr].unique()
-            df_nutr_src = pd.merge(df_nutrient, df_source, on=col_src)
-
+            # All sources providing this nutrient
             for nutr in nutrients:
+                # All primary sources
                 dflj = df_nutr_src[ (df_nutr_src[col_nutr]==nutr) &
                         (df_nutr_src[col_loc]==locj)]
                 sum_vtot_d = sum(dflj[col_vtot]/dflj[col_dist])
-                for ni,nrow in dfl.iterrows():
+                for ni,nrow in dflj.iterrows():
                     src = nrow[col_src]
-
-                    cons_uptake_jl = Constraint('cons_uptake_%s_%s'%(locj,src))
-                    cons_uptake_jl._constraint_sense = 'G'
-                    cons_uptake_jl._bound = sum_vtot_d
                     dfe = df_exchange[df_exchange[col_nutr]==src]
                     for ei,erow in dfe.iterrows():
                         ex_id = erow['rxn']
                         mdl   = model_dict[erow[col_org]]
+                        cons_uptake_jl = Constraint('cons_uptake_%s_%s_%s_%s'%(nutr,src,org_id,locj))
+                        cons_uptake_jl._constraint_sense = 'G'
+                        cons_uptake_jl._bound = sum_vtot_d
+                        model.add_metabolites(cons_uptake_jl)
+
                         ex_rxn = mdl.reactions.get_by_id(ex_id)
                         ex_rxn.add_metabolites({cons_uptake_jl:1.}, combine=False)
 
-                # Add contribution by other producers
+                        # Add contribution by other producers
+                        for locp in J:
+                            if locp != locj:
+                                d_jp = df_location[(df_location.i==locj) &
+                                        (df_location.j==locp)]['d'].iloc[0]
+                                # Check which mdls at other locs can make this nutrient
+                                for org_id in org_ids:
+                                    ex_id = "EX_%s_%s_%s"%(nutr,org_id,locp)
+                                    if model.reactions.has_id(ex_id):
+                                        rxn_synth = model.reactions.get_by_id(ex_id)
+                                        rxn_synth.add_metabolites({cons_uptake_jl:-1./d_jp}, combine=False)
+
+        #----------------------------------------------------
+        # Check all exchangable metabolites
+
 
     def stack_models(self):
         """
