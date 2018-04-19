@@ -663,13 +663,13 @@ class ObservedModel(cobra.core.Model):
         # # Make metabolites ObservedDictList
         # self.metabolites = ObservedDictList(observer.metabolites, self.metabolites)
 
-    def add_reactions(self, rxns):
-        self.observer.add_reactions(rxns)
-        super(ObservedModel, self).add_reactions(rxns)
+    def add_reactions(self, *args, **kwargs):
+        self.observer.add_reactions(*args, **kwargs)
+        super(ObservedModel, self).add_reactions(*args, **kwargs)
 
-    def add_metabolites(self, mets):
-        self.observer.add_metabolites(mets)
-        super(ObservedModel, self).add_metabolites(mets)
+    def add_metabolites(self, *args, **kwargs):
+        self.observer.add_metabolites(*args, **kwargs)
+        super(ObservedModel, self).add_metabolites(*args, **kwargs)
 
 
 class StackOptimizer(object):
