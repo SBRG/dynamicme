@@ -194,8 +194,9 @@ class Locater(object):
                 for locj in locs:
                     if locj != locp:
                         e_id = 'e_%s_%s_%s'%(locp,locj,met)
-                        e_pjl = model.reactions.get_by_id(e_id)
-                        e_pjl.add_metabolites({cons:1.}, combine=False)
+                        if model.reactions.has_id(e_id):
+                            e_pjl = model.reactions.get_by_id(e_id)
+                            e_pjl.add_metabolites({cons:1.}, combine=False)
 
         # 6) sum_j s_ijl <= smax_il, i in Sources, l in Shared
         df_primary_feed = df_source[df_source['source']=='primary']
