@@ -59,8 +59,9 @@ class Locater(object):
              -vkjl_up <= sum_i s_ijl/dij + sum_p e_pjl/dpj, (4)
                 k in Orgs, j in Nodes, l in Shared
              sum_j e_pjl <= sum_k vkex_pl,          (5)
-                p in Nodes
-             sum_j s_ijl <= smax_il, i in Sources   (6)
+                p in Nodes, l in Shared
+             sum_j s_ijl <= smax_il,                (6)
+                i in Sources, l in Shared
              sum_j ykj <= Xk0 + Xk0*sum_j mukj*Tfj, (7)
                 k in Orgs
         """
