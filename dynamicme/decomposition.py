@@ -2882,7 +2882,13 @@ class LagrangeMaster(object):
         if heuristic=='average':
             ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for 
                 sub in sub_dict.values()])
-            y0 = ymat.mean(axis=0).round()
+            #------------------------------------------------
+            # Only need to round if not continuous
+            # y0 = ymat.mean(axis=0).round()
+            ym = ymat.mean(axis=0)
+            y0 = np.array(
+                    [ymi if y.VType==GRB.CONTINUOUS else ymi.round() for y,ymi in zip(sub._ys,ym)])
+            #------------------------------------------------
             obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
 
             are_feas = feas_dict.values()

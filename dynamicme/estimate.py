@@ -10,6 +10,7 @@
 
 from __future__ import division
 from six import iteritems
+from six import string_types
 
 from optimize import StackOptimizer, SplitOptimizer, Optimizer
 from optimize import Variable, Constraint
@@ -146,22 +147,40 @@ class RadixEstimator(Estimator):
 
         # Constraint-specific
         prevent_zero = self.prevent_zero
-        cons_ref = base_model.metabolites.get_by_id(fit_constraint_id)
-        var_cons_dict = {}
-        for rxn_ref in cons_ref.reactions:
-            for mdl_ind, mdl in iteritems(stacker.model_dict):
-                constraint_p = mdl.metabolites.get_by_id(fit_constraint_id+'_%s'%mdl_ind)
-                var_d = mdl.reactions.get_by_id('wa_%s'%constraint_p.id)
-                rxn_p = mdl.reactions.get_by_id(rxn_ref.id+'_%s'%mdl_ind)
-                # Get coeff in dual
-                cons_ds = [m for m in var_d.metabolites.keys() if rxn_p.id==m.id]
-                a0 = rxn_p.metabolites[constraint_p]
-                if var_cons_dict.has_key(rxn_ref.id):
-                    var_cons_dict[rxn_ref.id] += [(rxn_p, constraint_p, a0)] + \
-                            [(var_d, cons_d, a0) for cons_d in cons_ds]
-                else:
-                    var_cons_dict[rxn_ref.id] = [(rxn_p, constraint_p, a0)] + \
-                            [(var_d, cons_d, a0) for cons_d in cons_ds]
+        # If one constraint provided
+        if isinstance(fit_constraint_id, string_types):
+            cons_ref = base_model.metabolites.get_by_id(fit_constraint_id)
+            var_cons_dict = {}
+            for rxn_ref in cons_ref.reactions:
+                for mdl_ind, mdl in iteritems(stacker.model_dict):
+                    constraint_p = mdl.metabolites.get_by_id(fit_constraint_id+'_%s'%mdl_ind)
+                    var_d = mdl.reactions.get_by_id('wa_%s'%constraint_p.id)
+                    rxn_p = mdl.reactions.get_by_id(rxn_ref.id+'_%s'%mdl_ind)
+                    # Get coeff in dual
+                    cons_ds = [m for m in var_d.metabolites.keys() if rxn_p.id==m.id]
+                    a0 = rxn_p.metabolites[constraint_p]
+                    if var_cons_dict.has_key(rxn_ref.id):
+                        var_cons_dict[rxn_ref.id] += [(rxn_p, constraint_p, a0)] + \
+                                [(var_d, cons_d, a0) for cons_d in cons_ds]
+                    else:
+                        var_cons_dict[rxn_ref.id] = [(rxn_p, constraint_p, a0)] + \
+                                [(var_d, cons_d, a0) for cons_d in cons_ds]
+        else:
+            var_cons_dict = {}
+            for (cons_ref,rxn_ref) in fit_constraint_id:
+                for mdl_ind, mdl in iteritems(stacker.model_dict):
+                    constraint_p = mdl.metabolites.get_by_id(cons_ref.id+'_%s'%mdl_ind)
+                    var_d = mdl.reactions.get_by_id('wa_%s'%constraint_p.id)
+                    rxn_p = mdl.reactions.get_by_id(rxn_ref.id+'_%s'%mdl_ind)
+                    # Get coeff in dual
+                    cons_ds = [m for m in var_d.metabolites.keys() if rxn_p.id==m.id]
+                    a0 = rxn_p.metabolites[constraint_p]
+                    if var_cons_dict.has_key(rxn_ref.id):
+                        var_cons_dict[rxn_ref.id] += [(rxn_p, constraint_p, a0)] + \
+                                [(var_d, cons_d, a0) for cons_d in cons_ds]
+                    else:
+                        var_cons_dict[rxn_ref.id] = [(rxn_p, constraint_p, a0)] + \
+                                [(var_d, cons_d, a0) for cons_d in cons_ds]
 
         opt.to_radix(stacker.model,var_cons_dict,
                 radix,powers,digits=digits,prevent_zero=prevent_zero)

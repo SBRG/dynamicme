@@ -40,6 +40,14 @@ class Variable(Reaction):
 class Constraint(Metabolite):
     pass
 
+class EnzymeConc(Variable):
+    def __init__(self, *args, **kwargs):
+        self.kDa = None
+        super(EnzymeConc, self).__init__(*args, **kwargs)
+
+    @property
+    def mass(self):
+        return self.kDa
 
 class Optimizer(object):
     """
