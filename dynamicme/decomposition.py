@@ -1571,11 +1571,12 @@ class LagrangeSubmodel(object):
     and Hk constrain yk to be the same across all subproblems.
     """
     def __init__(self, cobra_model, _id, first_stage_vars=None, solver='gurobi', weight=1.,
-            Q=None):
+            Q=None, bisection=False):
         """
         """
         self._id = _id
         self.cobra_model = cobra_model
+        self.solver = solver
         self._weight = weight
         A,B,d,dsenses,xs,ys,C,b,bsenses,mets_d,mets_b = split_cobra(cobra_model, first_stage_vars)
         self._A = A
@@ -1597,6 +1598,15 @@ class LagrangeSubmodel(object):
         self.x_dict={}
         self.ObjVal = None
         self.max_alt = None
+        self.bisection = bisection
+        self.bisect_lb = None
+        self.bisect_ub = None
+        self.bisect_abs_precision = 0.01
+        self.bisect_rel_precision = None
+        self.bisect_max_iter = 1e3
+        self.bisect_verbosity = 0
+        self.subs_bounds = None
+        self.subs_constraints = None
 
         # self.model = self.init_model(xs, A, d, csenses)
         self.model = self.init_model()
@@ -1687,11 +1697,14 @@ class LagrangeSubmodel(object):
         model.setObjective(obj_fun, GRB.MINIMIZE)
         model.update()
 
-    def optimize(self, xk=None, yk=None):
+    def optimize(self, xk=None, yk=None, bisection=None):
         """
         Solve with warm-start.
         Some solvers do this automatically.
         """
+        if bisection is None:
+            bisection = self.bisection
+        solver = self.solver
         model = self.model
         xs = self._xs
         ys = self._ys
@@ -1705,17 +1718,150 @@ class LagrangeSubmodel(object):
             for y,yopt in zip(ys,yk):
                 y.Start = yopt
 
-        model.optimize()
-
-        if model.SolCount>0:
-            objval = model.ObjVal
-            self.yopt = np.array([y.X for y in ys])
-            self.x_dict = {v.VarName:v.X for v in model.getVars()}
-            self.ObjVal = objval
+        if bisection:
+            objval = self.solve_bisection(
+                    self.bisect_abs_precision, self.bisect_lb, self.bisect_ub,
+                    rel_precision=self.bisect_rel_precision,
+                    max_iter=self.bisect_max_iter,
+                    verbosity=self.bisect_verbosity)
         else:
-            objval = np.nan
+            model.optimize()
+            if model.SolCount>0:
+                objval = model.ObjVal
+                self.yopt = np.array([y.X for y in ys])
+                self.x_dict = {v.VarName:v.X for v in model.getVars()}
+                self.ObjVal = objval
+            else:
+                objval = np.nan
 
         return objval
+
+    def solve_bisection(self, abs_precision, a, b, minimize=True, max_iter=1e3,
+            rel_precision=None, verbosity=0):
+        """
+        Solve using bisection
+
+        Inputs
+        bisect_var : which variable to bisect.
+        abs_precision : final precision = b-a
+        rel_precision : final relative precision = |b-a|/(1e-10 + |b|)
+        a : starting lower bound
+        b : starting upper bound
+        minimize : bisect to minimize, if False, maximize.
+        """
+        ybest = None
+        xd_best = None
+        best_obj = np.nan
+
+        mid = (b-a)/2.
+        abs_prec = b-a
+        rel_prec = abs(b-a) / (1e-10 + abs(b))
+        if rel_precision is not None:
+            converged_rel = rel_prec <= rel_precision
+        else:
+            converged_rel = False
+        if abs_precision is not None:
+            converged_abs = abs_prec <= abs_precision
+        else:
+            converged_abs = False
+        converged = converged_abs or converged_rel
+
+        _iter = 0
+        tic = time.time()
+        #----------------------------------------------------
+        if verbosity>0:
+            print("%8s%12s%12s%12s%12s%12s%12s%12s" % (
+                'Iter','point','a_new','b_new','gap','relgap(%)','objval','Time(s)'))
+            print("%8s%12s%12s%12s%12s%12s%12s%12s" % (
+                '-'*7,'-'*11,'-'*11,'-'*11,'-'*11,'-'*11,'-'*11,'-'*11))
+
+        while not converged and _iter < max_iter:
+            _iter += 1
+            mid = (b+a)/2.
+            self.substitute_mu(mid)
+            objval = self.optimize(bisection=False)
+
+            if np.isnan(objval):
+                if minimize:
+                    a = mid
+                else:
+                    b = mid
+            else:
+                # Save best sol
+                best_obj = objval
+                ybest = self.yopt
+                xd_best = self.x_dict
+
+                if minimize:
+                    b = mid
+                else:
+                    a = mid
+            # Update interval
+            rel_prec = abs(b-a) / (1e-10 + abs(b))
+            abs_prec = b-a
+            # Check convergence
+            if rel_precision is not None:
+                converged_rel = rel_prec <= rel_precision
+            else:
+                converged_rel = False
+            if abs_precision is not None:
+                converged_abs = abs_prec <= abs_precision
+            else:
+                converged_abs = False
+            converged = converged_abs or converged_rel
+            toc = time.time()-tic
+            #------------------------------------------------
+            if verbosity>0:
+                print(
+                "%8.6s%12.4g%12.4g%12.4g%12.4g%12.4g%12.4g%10.8s" % (
+                _iter,mid,a,b,abs_prec,rel_prec,objval,toc))
+
+
+        self.yopt = ybest
+        self.x_dict = xd_best
+        self.ObjVal = best_obj
+
+        return best_obj
+
+    def substitute_mu(self, mu_val):
+        """
+        Substitute value in for symbolic variable
+        subs_bounds : list of (rxn,lb_expr,ub_expr)
+            - lb_expr is any function where lb_expr(mu_k) = lb_k. Same for ub_expr.
+        subs_constraints : list of (met,rxn,expr)
+        """
+        subs_bounds = self.subs_bounds
+        if subs_bounds is not None:
+            for (rxn,lb,ub) in subs_bounds:
+                if lb is not None:
+                    self.update_bound(rxn, lb=lb(mu_val))
+                if ub is not None:
+                    self.update_bound(rxn, ub=ub(mu_val))
+
+        subs_constraints = self.subs_constraints
+        if subs_constraints is not None:
+            for (met,rxn,expr) in subs_constraints:
+                self.update_coeff(met,rxn,expr(mu_val))
+
+    def update_bound(self, rxn_id, lb=None, ub=None):
+        """
+        Update bounds in problem
+        """
+        model = self.model
+        v = model.getVarByName(rxn_id)
+        if v is None:
+            raise KeyError("variable %s not found!"%rxn_id)
+        if lb is not None:
+            v.LB = lb
+        if ub is not None:
+            v.UB = ub
+
+
+    def compile_substitution(self, subs_bounds=None, subs_constraints=None):
+        """
+        Compile substitutable bounds and/or constraint coefficients.
+        """
+
 
 
 class LagrangeMaster(object):
@@ -2071,10 +2217,12 @@ class LagrangeMaster(object):
             obj = sub.optimize(yk=sub.yopt) * sub._weight
             #********************************************
             sub_objs.append(obj)
-            if sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+            if np.isnan(obj):
+                # if sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
                 if verbosity>0:
-                    print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
-                        sub_ind, status_dict[sub.model.Status], sub.model.Status))
+                    #print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
+                    #    sub_ind, status_dict[sub.model.Status], sub.model.Status))
+                    print("Relaxed subproblem %s has objval=%s."%(sub_ind, obj))
                 return None
 
         objval = sum(sub_objs)
@@ -2201,18 +2349,22 @@ class LagrangeMaster(object):
                 obj = sub.optimize(yk=sub.yopt) * sub._weight
                 #********************************************
                 sub_objs.append(obj)
-                if sub.model.Status == GRB.OPTIMAL:
+                if not np.isnan(obj):
+                    # sub.model.Status == GRB.OPTIMAL:
                     if multicut:
                         cut = self.make_multicut(sub)
                         model.addConstr(cut)
-                elif sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+                elif np.isnan(obj):
+                    #elif sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
                     # If RELAXED subproblem is INFEASIBLE, ORIGINAL problem was INFEASIBLE.
                     # raise Exception(
                     #         "Relaxed subproblem is Infeasible or Unbounded. Status=%s (%s)."%(
                     #     status_dict[sub.model.Status], sub.model.Status))
                     if verbosity>0:
-                        print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
-                            sub_ind, status_dict[sub.model.Status], sub.model.Status))
+                        #print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
+                        #    sub_ind, status_dict[sub.model.Status], sub.model.Status))
+                        print("Relaxed subproblem %s has objval=%s."%(
+                            sub_ind, obj))
                     return None
 
             toc_sub = time.time()-tic_sub

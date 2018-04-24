@@ -81,6 +81,9 @@ class Locater(object):
         model_dict = self.model_dict
         for mdl_id,mdl in iteritems(model_dict):
             # mdl_id: modelk_nodej
+            cons_lbs = []
+            cons_ubs = []
+
             ykj = Variable('y_%s'%mdl_id, lower_bound=0, upper_bound=1)
             ykj.variable_kind = 'integer'
             mdl.add_reaction(ykj)
@@ -88,15 +91,33 @@ class Locater(object):
                 cons_lb = Constraint('binary_lb_%s'%rxn.id)
                 cons_lb._bound = 0.
                 cons_lb._constraint_sense = 'L'
-                mdl.add_metabolites(cons_lb)
-                rxn.add_metabolites({cons_lb:-1.}, combine=False)
-                ykj.add_metabolites({cons_lb:rxn.lower_bound}, combine=False)
+                #--------------------------------------------
+                # mdl.add_metabolites(cons_lb)
+                cons_lbs.append(cons_lb)
+                #--------------------------------------------
+                #rxn.add_metabolites({cons_lb:-1.}, combine=False)
+                rxn._metabolites[cons_lb] = -1.
+                cons_lb._reaction.add(rxn)
+                #--------------------------------------------
+                #ykj.add_metabolites({cons_lb:rxn.lower_bound}, combine=False)
+                ykj._metabolites[cons_lb] = rxn.lower_bound
+                cons_lb._reaction.add(ykj)
+                #--------------------------------------------
                 cons_ub = Constraint('binary_ub_%s'%rxn.id)
                 cons_ub._bound = 0.
                 cons_ub._constraint_sense = 'L'
-                mdl.add_metabolites(cons_ub)
-                rxn.add_metabolites({cons_ub:1.}, combine=False)
-                ykj.add_metabolites({cons_ub:-rxn.upper_bound}, combine=False)
+                #--------------------------------------------
+                # mdl.add_metabolites(cons_ub)
+                cons_ubs.append(cons_ub)
+                #--------------------------------------------
+                #rxn.add_metabolites({cons_ub:1.}, combine=False)
+                rxn._metabolites[cons_ub] = 1.
+                cons_ub._reaction.add(rxn)
+                #ykj.add_metabolites({cons_ub:-rxn.upper_bound}, combine=False)
+                ykj._metabolites[cons_ub] = -rxn.upper_bound
+                cons_ub._reaction.add(ykj)
+                #--------------------------------------------
+            mdl.add_metabolites(cons_lbs+cons_ubs)
 
         # 3) sum_k ykj <= 1,  j in Nodes
         organisms = [mdl.id for mdl in models]
@@ -136,18 +157,19 @@ class Locater(object):
 
                 for si,srow in df_primary.iterrows():
                     loci = int(srow['node'])
-                    dij  = df_distance[
-                           (df_distance['i']==loci) & (df_distance['j']==locj)]['d'].iloc[0]
-                    sid = 's_%s_%s_%s'%(loci, locj, met)
-                    if model.reactions.has_id(sid):
-                        sijl = model.reactions.get_by_id(sid)
-                    else:
-                        sijl = Variable(sid)
-                        sijl.lower_bound = 0.
-                        sijl.upper_bound = 1000.
-                        model.add_reactions(sijl)
-                    #svars.append(sijl)
-                    sijl.add_metabolites({cons:-1./dij}, combine=False)
+                    if loci != locj:
+                        dij  = df_distance[
+                               (df_distance['i']==loci) & (df_distance['j']==locj)]['d'].iloc[0]
+                        sid = 's_%s_%s_%s'%(loci, locj, met)
+                        if model.reactions.has_id(sid):
+                            sijl = model.reactions.get_by_id(sid)
+                        else:
+                            sijl = Variable(sid)
+                            sijl.lower_bound = 0.
+                            sijl.upper_bound = 1000.
+                            model.add_reactions(sijl)
+                        #svars.append(sijl)
+                        sijl.add_metabolites({cons:-1./dij}, combine=False)
 
                 # Cross-feed sources
                 df_cross = df_src_l[ df_src_l['source']!='primary']
@@ -212,9 +234,10 @@ class Locater(object):
                 cons._constraint_sense = 'L'
                 model.add_metabolites(cons)
                 for locj in locs:
-                    s_id  = 's_%s_%s_%s'%(loci,locj,met)
-                    s_ijl = model.reactions.get_by_id(s_id)
-                    s_ijl.add_metabolites({cons:1.}, combine=False)
+                    if loci != locj:
+                        s_id  = 's_%s_%s_%s'%(loci,locj,met)
+                        s_ijl = model.reactions.get_by_id(s_id)
+                        s_ijl.add_metabolites({cons:1.}, combine=False)
 
         # 7) sum_j ykj <= Xk0 + Xk0*sum_j mukj*Tfj
         # 7) sum_j ykj - Xk0*sum_j mukj*Tfj <= Xk0
