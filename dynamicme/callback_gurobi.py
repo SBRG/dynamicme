@@ -190,6 +190,8 @@ def cb_benders_multi(model, where):
             if cut_strategy=='maximal' and y0 is not None:
                 iter_mp = master._iter
                 sub.update_maximal_obj(yopt, y0, iter_mp, GAPABS)
+            elif cut_strategy=='proximal':
+                sub.update_proximal_obj(yopt)
             else:
                 sub.update_obj(yopt)
             sub.model.optimize(precision=precision_sub)
@@ -304,6 +306,10 @@ def cb_benders_multi(model, where):
             for sub_ind in opt_sub_inds:
                 sub = sub_dict[sub_ind]
                 optcut = master.make_optcut(sub)
+                #********************************************
+                # Make cut more aggressively pulled in to model
+                optcut.Lazy = 3
+                #********************************************
                 master.optcuts.add(optcut)
                 # cut produces an extreme point even if y fractional.
                 # If fractional, can it exclude incumbent?

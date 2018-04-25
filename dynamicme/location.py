@@ -56,14 +56,19 @@ class Locater(object):
         s.t. Sk vkj = 0                             (1)
              lk*ykj <= vkj <= uk*ykj                (2)
              sum_k ykj <= 1,  j in Nodes            (3)
-             -vkjl_up <= sum_i s_ijl/dij + sum_p e_pjl/dpj, (4)
+             -vkjl_up <= sum_i s_ijl + sum_p e_pjl, (4)
                 k in Orgs, j in Nodes, l in Shared
-             sum_j e_pjl <= sum_k vkex_pl,          (5)
+             sum_j e_pjl * dpj <= sum_k vkex_pl,          (5)
                 p in Nodes, l in Shared
-             sum_j s_ijl <= smax_il,                (6)
+             sum_j s_ijl * dij <= smax_il,                (6)
                 i in Sources, l in Shared
              sum_j ykj <= Xk0 + Xk0*sum_j mukj*Tfj, (7)
                 k in Orgs
+            ------------------------------------------------
+            (redundant?)
+             s_ijl <= smax_il / dij                 (8)
+             e_pjl <= vkex_pl / dpj                 (9)
+            ------------------------------------------------
         """
         model = Model('stacked')
         # Only organism node locations
@@ -130,9 +135,10 @@ class Locater(object):
                 ykj = model.reactions.get_by_id('y_%s_%s'%(org,locj))
                 ykj.add_metabolites({cons:1.}, combine=False)
 
-        # 4) -vkjl_up <= sum_i s_ijl/dij + sum_p e_pjl/dpj
-        # 4) -vkjl_up - sum_i s_ijl/dij - sum_p e_pjl/dpj <= 0,
+        # 4) -vkjl_up <= sum_i s_ijl + sum_p e_pjl
+        # 4) -vkjl_up - sum_i s_ijl - sum_p e_pjl <= 0,
         #       k in Orgs, j in Nodes, l in Shared
+        #    
         # svars = []  # Gather and add to model at the end
         # evars = []
         for ri,row in df_consumer.iterrows():
@@ -158,8 +164,8 @@ class Locater(object):
                 for si,srow in df_primary.iterrows():
                     loci = int(srow['node'])
                     if loci != locj:
-                        dij  = df_distance[
-                               (df_distance['i']==loci) & (df_distance['j']==locj)]['d'].iloc[0]
+                        # dij  = df_distance[
+                        #        (df_distance['i']==loci) & (df_distance['j']==locj)]['d'].iloc[0]
                         sid = 's_%s_%s_%s'%(loci, locj, met)
                         if model.reactions.has_id(sid):
                             sijl = model.reactions.get_by_id(sid)
@@ -169,7 +175,7 @@ class Locater(object):
                             sijl.upper_bound = 1000.
                             model.add_reactions(sijl)
                         #svars.append(sijl)
-                        sijl.add_metabolites({cons:-1./dij}, combine=False)
+                        sijl.add_metabolites({cons:-1.}, combine=False)
 
                 # Cross-feed sources
                 df_cross = df_src_l[ df_src_l['source']!='primary']
@@ -178,8 +184,8 @@ class Locater(object):
                     org_x = srow['source']
                     for locp in locs:
                         if locp != locj:
-                            dpj  = df_distance[
-                                (df_distance['i']==locp) & (df_distance['j']==locj)]['d'].iloc[0]
+                            # dpj  = df_distance[
+                            #     (df_distance['i']==locp) & (df_distance['j']==locj)]['d'].iloc[0]
                             eid ='e_%s_%s_%s'%(locp,locj,met)
                             if model.reactions.has_id(eid):
                                 epjl = model.reactions.get_by_id(eid)
@@ -189,12 +195,12 @@ class Locater(object):
                                 epjl.upper_bound = 1000.
                                 model.add_reactions(epjl)
                             # evars.append(epjl)
-                            epjl.add_metabolites({cons:-1./dpj}, combine=False)
+                            epjl.add_metabolites({cons:-1.}, combine=False)
 
         # model.add_reactions(svars + evars)
 
-        # 5) sum_j e_pjl <= sum_k vkex_pl, p in Nodes, l in Shared
-        # 5) sum_j e_pjl - sum_k vkex_pl <= 0, p in Nodes, l in Shared
+        # 5) sum_j e_pjl*dpj <= sum_k vkex_pl, p in Nodes, l in Shared
+        # 5) sum_j e_pjl*dpj - sum_k vkex_pl <= 0, p in Nodes, l in Shared
         df_cross_feed = df_source[~df_source['rxn'].isnull()]
         cross_mets = df_cross_feed['met'].unique()
         for met in cross_mets:
@@ -216,12 +222,14 @@ class Locater(object):
                 # e_pjl: only cross-feed supplied
                 for locj in locs:
                     if locj != locp:
+                        dpj  = df_distance[
+                            (df_distance['i']==locp) & (df_distance['j']==locj)]['d'].iloc[0]
                         e_id = 'e_%s_%s_%s'%(locp,locj,met)
                         if model.reactions.has_id(e_id):
                             e_pjl = model.reactions.get_by_id(e_id)
-                            e_pjl.add_metabolites({cons:1.}, combine=False)
+                            e_pjl.add_metabolites({cons:1.*dpj}, combine=False)
 
-        # 6) sum_j s_ijl <= smax_il, i in Sources, l in Shared
+        # 6) sum_j s_ijl*dij <= smax_il, i in Sources, l in Shared
         df_primary_feed = df_source[df_source['source']=='primary']
         primary_mets = df_primary_feed['met'].unique()
         for met in primary_mets:
@@ -235,9 +243,11 @@ class Locater(object):
                 model.add_metabolites(cons)
                 for locj in locs:
                     if loci != locj:
+                        dij  = df_distance[
+                               (df_distance['i']==loci) & (df_distance['j']==locj)]['d'].iloc[0]
                         s_id  = 's_%s_%s_%s'%(loci,locj,met)
                         s_ijl = model.reactions.get_by_id(s_id)
-                        s_ijl.add_metabolites({cons:1.}, combine=False)
+                        s_ijl.add_metabolites({cons:1.*dij}, combine=False)
 
         # 7) sum_j ykj <= Xk0 + Xk0*sum_j mukj*Tfj
         # 7) sum_j ykj - Xk0*sum_j mukj*Tfj <= Xk0
@@ -441,7 +451,7 @@ class LocateMM(object):
                     l \in Nutrients, k\in Orgs, j \in Locations
 
                 vtot_il <= sum_k sum_j vklij * dij,  l \in Nutrients, i \in Sources (uptake v<=0)
-                [Redundant: vtot_il / dij <= vklij,   l \in Nutrients (uptake v<=0)]
+                [Redundant: vtot_il * dij <= vklij,   l \in Nutrients (uptake v<=0)]
                 yjk \in {0,1}
         """
         stacked_model = Model('stacked')

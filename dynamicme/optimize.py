@@ -679,6 +679,10 @@ class ObservedModel(cobra.core.Model):
         self.observer.add_metabolites(*args, **kwargs)
         super(ObservedModel, self).add_metabolites(*args, **kwargs)
 
+    def remove_reactions(self, *args, **kwargs):
+        self.observer.remove_reactions(*args, **kwargs)
+        super(ObservedModel, self).remove_reactions(*args, **kwargs)
+
 
 class StackOptimizer(object):
     def __init__(self):
