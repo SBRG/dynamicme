@@ -2395,9 +2395,9 @@ class LagrangeMaster(object):
         return objval
 
 
-    def optimize(self, feasible_methods=['heuristic','enumerate'], bundle=False,
+    def optimize(self, feasible_methods=['best_rounding','enumerate'], bundle=False,
             multicut=True, max_alt=10, alt_method='pool', nogood_cuts=False,
-            early_heuristics=[]):
+            early_heuristics=[], strictUB=False):
         """
         x_dict = optimize()
 
@@ -2413,7 +2413,8 @@ class LagrangeMaster(object):
         Inputs
         feasible_methods :methods to construct feasible solution
                           for complicating (integer) variables.
-                          - heuristic : use heuristic
+                          - best_rounding : binary (or golden section) search rounding
+                          - average : simple rounding
                           - enumerate : enumerate alternate optima
                           - benders : Benders' decomposition, making overall
                             procedure a cross-decomposition.
@@ -2459,8 +2460,14 @@ class LagrangeMaster(object):
         LB = -1e100     # Underestimator from dual relaxed subproblems
         bestLB = LB
         bestUB = UB     # Given by best feasible solution, not the master problem
-        gap = bestUB-bestLB
-        relgap = gap/(1e-10+abs(UB))
+        if strictUB:
+            gap = feasUB-bestLB
+        else:
+            gap = bestUB-bestLB
+        if strictUB:
+            relgap = gap/(1e-10+abs(feasUB))
+        else:
+            relgap = gap/(1e-10+abs(bestUB))
         uk = np.zeros(nu)
         self.uk = uk
         u0 = np.zeros(nu)   # Trust region center
@@ -2576,6 +2583,7 @@ class LagrangeMaster(object):
             bestUB = UB     # Since proximal penalty might bias it
             #----------------------------------------------------
             # Update bounds and check convergence
+            # Lagrange multipliers were chosen to find the max lb
             LB = sum(sub_objs)
             if LB > bestLB:
                 bestLB = LB
@@ -2598,10 +2606,16 @@ class LagrangeMaster(object):
                                 x_dict[sub._ys[j].VarName] = yj
                             if verbosity>1:
                                 print("Best Heuristic solution has objval=%s"%(feasUB))
-                            gap = abs(bestUB-bestLB)
+                            if strictUB:
+                                gap = abs(feasUB-bestLB)
+                            else:
+                                gap = abs(bestUB-bestLB)
                             if abs(gap)<absgaptol:
                                 gap = 0.
-                            relgap = gap/(1e-10+abs(bestUB))
+                            if strictUB:
+                                relgap = gap/(1e-10+abs(feasUB))
+                            else:
+                                relgap = gap/(1e-10+abs(bestUB))
                             if relgap <= gaptol:
                                 #--------------------------------------------
                                 # Final QC that sum_k Hk*yk = 0
@@ -2610,7 +2624,7 @@ class LagrangeMaster(object):
                                     yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
                                     Hyk = sub._H*yk
                                     Hys.append(Hyk)
-                                if verbosity>1:
+                                if verbosity>2:
                                     print("sum_k Hk*yk: %s"%(sum(Hys)))
                                     if sum([abs(x) for x in sum(Hys)]) > feastol:
                                         print("WARNING: Non-anticipativity constraints not satisfied.")
@@ -2626,10 +2640,16 @@ class LagrangeMaster(object):
 
             # Quadratic stabilization term can cause "best" LB and UB to change
             # non monotonically, not guaranteeing bestUB > bestLB
-            gap = abs(bestUB-bestLB)
+            if strictUB:
+                gap = abs(feasUB-bestLB)
+            else:
+                gap = abs(bestUB-bestLB)
             if abs(gap)<absgaptol:
                 gap = 0.
-            relgap = gap/(1e-10+abs(bestUB))
+            if strictUB:
+                relgap = gap/(1e-10+abs(feasUB))
+            else:
+                relgap = gap/(1e-10+abs(bestUB))
             res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
             #------------------------------------------------
             # Log progress
@@ -2659,8 +2679,12 @@ class LagrangeMaster(object):
                 # including heuristics, B&B, and enumeration.
                 #--------------------------------------------
                 if feasible_methods:
-                    if 'heuristic' in feasible_methods:
-                        yfeas, feasUBk, is_optimal = self.feasible_heuristics('average')
+                    for method in feasible_methods:
+                        if method=='enumerate':
+                            yfeas, feasUBk, is_optimal = self.enum_alt_opt(first_feasible=True,
+                                    max_alt=max_alt, method=alt_method, nogood_cuts=nogood_cuts)
+                        else:
+                            yfeas, feasUBk, is_optimal = self.feasible_heuristics(method)
                         if yfeas is not None:
                             if feasUBk < feasUB:
                                 feasUB = feasUBk
@@ -2670,42 +2694,6 @@ class LagrangeMaster(object):
                                     x_dict[sub._ys[j].VarName] = yj
                                 if verbosity>1:
                                     print("Best Heuristic solution has objval=%s"%(feasUB))
-
-                            if is_optimal:
-                                #--------------------------------------------
-                                # Final QC that sum_k Hk*yk = 0
-                                Hys = []
-                                for sub_ind,sub in iteritems(sub_dict):
-                                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
-                                    Hyk = sub._H*yk
-                                    Hys.append(Hyk)
-                                if verbosity>1:
-                                    print("sum_k Hk*yk: %s"%(sum(Hys)))
-                                    if sum([abs(x) for x in sum(Hys)]) > feastol:
-                                        print("WARNING: Non-anticipativity constraints not satisfied.")
-                                #--------------------------------------------
-                                # Final Log
-                                toc = time.time()-tic
-                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
-                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
-                                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-                                break
-
-                    # Move on to the next primal recovery method
-                    if 'enumerate' in feasible_methods:
-                        yfeas, feasUBk, is_optimal = self.enum_alt_opt(first_feasible=True,
-                                max_alt=max_alt, method=alt_method, nogood_cuts=nogood_cuts)
-                        if yfeas is not None:
-                            #--------------------------------------------
-                            # Final solution candidate
-                            if feasUBk < feasUB:
-                                feasUB = feasUBk
-                                ybest = yfeas
-                                self.yopt = ybest
-                                for j,yj in enumerate(ybest):
-                                    x_dict[sub._ys[j].VarName] = yj
-                                if verbosity>1:
-                                    print("Best feasible solution has objval=%s"%(feasUB))
 
                             if is_optimal:
                                 #--------------------------------------------
@@ -2788,6 +2776,10 @@ class LagrangeMaster(object):
         """
         Solve LP relaxation.
         """
+        # Should not try to make integer feasible since LP relaxation
+        if not kwargs.has_key('feasible_methods'):
+            kwargs['feasible_methods'] = None
+
         model = self.model
         sub_dict = self.sub_dict
         xtype_dict = {sub_ind:[x.VType for x in sub._xs] for sub_ind,sub in iteritems(sub_dict)}
@@ -2860,7 +2852,7 @@ class LagrangeMaster(object):
                 sub.optimize()
                 bestobj = sub.ObjVal
 
-                if sub.model.SolCount>0:
+                if sub.model.SolCount>0 and hasattr(sub.model,'PoolObjVal'):
                     alt_sols = []
                     for k in range(sub.model.SolCount):
                         sub.model.Params.SolutionNumber=k
@@ -3055,6 +3047,82 @@ class LagrangeMaster(object):
             if np.all(are_feas):
                 yfeas = y0
                 feasUB = tot_obj
+
+        elif heuristic=='best_rounding':
+            """
+            Binary search to find the best rounding threshold
+            """
+            ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for 
+                sub in sub_dict.values()])
+            ym = ymat.mean(axis=0)
+            #------------------------------------------------
+            # Binary search to find best rounding threshold
+            a = 0.
+            b = 1.
+            precision = 0.1
+            dist  = b-a
+            tot_obj = 1e100
+            max_iter = 1e3
+
+            for _iter in range(max_iter):
+                mid = (a+b)/2.
+                x1  = (a+mid)/2.
+                x2  = (mid+b)/2.
+                # Only round if not continuous
+                y1 = np.array(
+                    [ymi if y.VType==GRB.CONTINUOUS else binary_thresh(ymi,x1)
+                        for y,ymi in zip(sub._ys,ym)])
+                y2 = np.array(
+                    [ymi if y.VType==GRB.CONTINUOUS else binary_thresh(ymi,x2)
+                        for y,ymi in zip(sub._ys,ym)])
+                # Fix the set covering constraint if necessary...
+                obj_dict1, feas_dict1, sub_stats1 = self.check_feasible(y1)
+                obj_dict2, feas_dict2, sub_stats2 = self.check_feasible(y2)
+                obj1 = sum(obj_dict1.values())
+                obj2 = sum(obj_dict2.values())
+                # Ensure feasible
+                if not all(feas_dict1.values()) or not all(feas_dict2.values()):
+                    # Then need to set more binaries to 1
+                    b = mid
+                else:
+                    if obj1 < obj2:
+                        b = mid
+                        yfeas = y1
+                        feasUB = obj1
+                        tot_obj = obj1
+                    else:
+                        a = mid
+                        yfeas = y2
+                        feasUB = obj2
+                        tot_obj = obj2
+
+                dist = b-a
+                if dist < precision:
+                    break
+
+            gap = abs(tot_obj-opt_obj)
+            relgap = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj))
+            is_optimal = gap <= self.absgaptol or relgap <= self.gaptol
+            #------------------------------------------------
+        elif heuristic=='parsimonious':
+            """
+            Especially useful for min sum y objective
+            """
+            #y0 = np.array([1. if v.Obj==0 else 0. for v in self._ys])
+            ptol = 1e-9
+            y0 = np.array([1. if v.objective_coefficient<=ptol else 0. for v in self._y0])
+            obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+
+            are_feas = feas_dict.values()
+            tot_obj = sum(obj_dict.values())
+            gap = abs(tot_obj-opt_obj)
+            relgap = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj))
+            is_optimal = gap <= self.absgaptol or relgap <= self.gaptol
+
+            if np.all(are_feas):
+                yfeas = y0
+                feasUB = tot_obj
+
         else:
             print("Unknown heuristic: %s"%heuristic)
 
@@ -3094,6 +3162,53 @@ class LagrangeMaster(object):
             y0 = ymat.mean(axis=0).round()
             obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
             feasUB = sum(obj_dict.values())
+        elif feasible_method=='best_rounding':
+            """
+            Binary search to find the best rounding threshold
+            """
+            ymat = np.array([[v.X for v in sub._ys] for sub in sub_dict.values()])
+            yr = ymat.mean(axis=0)
+            #------------------------------------------------
+            # Binary search to find best rounding threshold
+            a = 0.
+            b = 1.
+            precision = 0.05
+            feasUB = 1e100
+            gap  = b-a
+            y0 = yr.round()
+
+            while gap > precision:
+                mid = (a+b)/2.
+                x1  = (a+mid)/2.
+                x2  = (mid+b)/2.
+                y1  = yr.copy()
+                y1[yr<x1] = 0.
+                y1[yr>=x1] = 1.
+                y2  = yr.copy()
+                y2[yr<x2] = 0.
+                y2[yr>=x2] = 1.
+                # Fix the set covering constraint if necessary...
+                obj_dict1, feas_dict1, sub_stats1 = self.check_feasible(y1)
+                obj_dict2, feas_dict2, sub_stats2 = self.check_feasible(y2)
+                obj1 = sum(obj_dict1.values())
+                obj2 = sum(obj_dict2.values())
+                # Ensure feasible
+                if not all(feas_dict1.values()) or not all(feas_dict2.values()):
+                    # Then need to set more binaries to 1
+                    b = mid
+                else:
+                    if obj1 < obj2:
+                        b = mid
+                        y0 = y1
+                        feasUB = obj1
+                    else:
+                        a = mid
+                        y0 = y2
+                        feasUB = obj2
+
+                gap = b-a
+            #------------------------------------------------
+
         elif feasible_method is None:
             y0 = sub_dict[sub_dict.keys()[0]].yopt
             feasUB = UB
@@ -3409,7 +3524,7 @@ class LagrangeMasterMPI(LagrangeMaster):
                                         yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
                                         Hyk = sub._H*yk
                                         Hys.append(Hyk)
-                                    if verbosity>1:
+                                    if verbosity>2:
                                         print("sum_k Hk*yk: %s"%(sum(Hys)))
                                         if sum([abs(x) for x in sum(Hys)]) > feastol:
                                             print("WARNING: Non-anticipativity constraints not satisfied.")
@@ -3827,3 +3942,10 @@ class LagrangeMasterMPI(LagrangeMaster):
 
         return worker_tasks[rank]
 
+
+def binary_thresh(x, thresh):
+    if x<thresh:
+        y=0.
+    else:
+        y=1.
+    return y
