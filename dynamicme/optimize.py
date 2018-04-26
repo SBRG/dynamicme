@@ -366,6 +366,7 @@ class Optimizer(object):
         mdl.add_metabolites(cons_digs)
 
         if prevent_zero:
+            """ Set covering constraint """
             # sum_kl y_groupi >= 1
             for group_id, var_cons_coeff in iteritems(var_cons_dict):
                 cons = Constraint('force_nonzero_%s'%group_id)

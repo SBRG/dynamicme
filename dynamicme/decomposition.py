@@ -2125,7 +2125,7 @@ class LagrangeMaster(object):
         self.print_iter = 10
         self.time_limit = 1e30  # seconds
         self.max_iter = 1e6
-        self.delta_min = 1e-10
+        self.delta_min = 1e-20
         self.delta_mult = 0.5
         self.bundle_mult = 0.5
         self.max_max_alt = 200
@@ -2133,6 +2133,7 @@ class LagrangeMaster(object):
         self.uk = None
         self.x_dict = {}
         self.yopt = None
+        self.covered_dict = {}
 
         self.model = self.init_model(ys)
 
@@ -2401,6 +2402,8 @@ class LagrangeMaster(object):
         """
         x_dict = optimize()
 
+        method in LagrangeMaster //----------------------------------------------------
+
         Solution procedure
         Init Lagrange multipliers, u
         1) Update u in Lagrange relaxed subproblems
@@ -2484,7 +2487,7 @@ class LagrangeMaster(object):
         print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
             '-'*7,'-'*19,'-'*19,'-'*9,'-'*9,'-'*9,'-'*29))
         print("%8.6s%11.8s%11.8s%11.8s%11.8s%10.8s%10.8s%10.8s%10.8s%10.8s%10.8s" % (
-            '','Best','Feasible','Sub','Best','','','','total','master','sub'))
+            '','Dual','Feasible','Sub','Best','','','','total','master','sub'))
 
         # Don't pool solutions until gap below tolerance
         for sub in sub_dict.values():
@@ -2509,22 +2512,6 @@ class LagrangeMaster(object):
                 raise Exception("Master solver status=%s (%s). Aborting."%(
                     status_dict[model.Status], model.Status))
 
-            # self.update_obj(delta, u0)
-            # model.optimize()
-            # toc_master = time.time()-tic_master
-            # #if model.Status in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
-            # if model.SolCount > 0:
-            #     uk = np.array([u.X for u in self._us])
-            #     if model.Status != GRB.OPTIMAL:
-            #         warnings.warn("Solution available but Master solver status=%s (%s)."%(
-            #             status_dict[model.Status], model.Status))
-            #         if verbosity>1:
-            #             print("Master solver status=%s (%s)."%(
-            #                 status_dict[model.Status], model.Status))
-            # else:
-            #     raise Exception("Master solver status=%s (%s). Aborting."%(
-            #         status_dict[model.Status], model.Status))
-
             #----------------------------------------------------
             # Solve Subproblems
             #----------------------------------------------------
@@ -2542,31 +2529,6 @@ class LagrangeMaster(object):
                     cut = sub_result['cut']
                     model.addConstr(cut)
                     sub_objs.append(obj)
-
-#             sub_objs = []
-#             for sub_ind,sub in iteritems(sub_dict):
-#                 sub.update_obj(uk)
-#                 #********************************************
-#                 obj = sub.optimize(yk=sub.yopt) * sub._weight
-#                 #********************************************
-#                 sub_objs.append(obj)
-#                 if not np.isnan(obj):
-#                     # sub.model.Status == GRB.OPTIMAL:
-#                     if multicut:
-#                         cut = self.make_multicut(sub)
-#                         model.addConstr(cut)
-#                 elif np.isnan(obj):
-#                     #elif sub.model.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
-#                     # If RELAXED subproblem is INFEASIBLE, ORIGINAL problem was INFEASIBLE.
-#                     # raise Exception(
-#                     #         "Relaxed subproblem is Infeasible or Unbounded. Status=%s (%s)."%(
-#                     #     status_dict[sub.model.Status], sub.model.Status))
-#                     if verbosity>0:
-#                         #print("Relaxed subproblem %s is Infeasible or Unbounded. Status=%s (%s)."%(
-#                         #    sub_ind, status_dict[sub.model.Status], sub.model.Status))
-#                         print("Relaxed subproblem %s has objval=%s."%(
-#                             sub_ind, obj))
-#                     return None
 
             toc_sub = time.time()-tic_sub
 
@@ -2713,7 +2675,12 @@ class LagrangeMaster(object):
                                 self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
                                     'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
                                     'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-                                break
+                                toc = time.time()-tic
+                                if verbosity>0:
+                                    print(
+                                    "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
+                                    _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
+                                return x_dict
                         else:
                             if verbosity>0:
                                 print("Feasible solution not among alt opt. Trying next iteration.")
@@ -3123,6 +3090,56 @@ class LagrangeMaster(object):
                 yfeas = y0
                 feasUB = tot_obj
 
+        elif heuristic=='reduced_cost':
+            """
+            Also good for min sum y objective. Uses reduced cost
+            to select which (single) yj=1 within each covered set.
+            Might be infeasible for other constraints, in which case
+            need to make additional yj=1
+            """
+            if not hasattr(self,'covered_dict'):
+                raise Exception("reduced_cost heuristic needs master.covered_dict")
+            else:
+                if not self.covered_dict:
+                    raise Exception("reduced_cost heuristic needs non-empty master.covered_dict")
+                else:
+                    # Calculate reduced costs: fkj + (u'Hk)j
+                    us = self.uopt
+                    # or current us
+                    rcs = [sub._fy + us*sub._H for sub in sub_dict.values()]
+                    var_inds = {y.id:j for j,y in enumerate(self._y0)}
+                    ny = len(self._y0)
+                    ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for
+                        sub in sub_dict.values()])
+                    y0 = np.zeros(ny)
+                    for group,vs in iteritems(self.covered_dict):
+                        js  = [var_inds[v] for v in vs]
+                        rc_set = np.array(
+                                [[rcs[k][j] for j in js] for k,sub in enumerate(sub_dict.values())])
+                        rc_sum = rc_set.sum(axis=0)
+                        # Which ys inconsistent and need fixing?
+                        ys_equal = [all(ymat[:-1,j]==ymat[1:,j]) for j in range(ny)]
+                        for j,r in zip(js,rc_sum):
+                            if ys_equal[j]:
+                                y0[j]=ymat[0,j] # if equal can take any yk_j
+                            else: # If not equal across k need to fix
+                                if r==min(rc_sum):
+                                    y0[j] = 1.
+                                else:
+                                    y0[j] = 0.
+
+                    obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
+                    # Repair infeas if necessary
+
+                    are_feas = feas_dict.values()
+                    tot_obj = sum(obj_dict.values())
+                    gap = abs(tot_obj-opt_obj)
+                    relgap = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj))
+                    is_optimal = gap <= self.absgaptol or relgap <= self.gaptol
+
+                    if np.all(are_feas):
+                        yfeas = y0
+                        feasUB = tot_obj
         else:
             print("Unknown heuristic: %s"%heuristic)
 

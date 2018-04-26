@@ -63,6 +63,7 @@ class RadixEstimator(Estimator):
         self.digits = None
         self.kfit_dict = None
         self.col_ind = None
+        self.covered_dict = {}  # Set covering constraint info if prevent_zero
 
 
     def fit(self, base_model, df_X, df_Y, **kwargs):
@@ -187,6 +188,12 @@ class RadixEstimator(Estimator):
 
         if max_nonzero_binaries is not None:
             self.limit_nonzero_binaries(stacker.model, max_nonzero_binaries)
+
+        if prevent_zero:
+            # Keep track of covered sets
+            for group_id in var_cons_dict.keys():
+                cons = stacker.model.metabolites.get_by_id('force_nonzero_%s'%group_id)
+                self.covered_dict[group_id] = [rxn.id for rxn in cons.reactions]
 
         #----------------------------------------------------
         # Update self
