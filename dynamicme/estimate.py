@@ -14,7 +14,6 @@ from six import string_types
 
 from optimize import StackOptimizer, SplitOptimizer, Optimizer
 from optimize import Variable, Constraint
-from decomposition import BendersMaster, BendersSubmodel
 from generate import copy_model
 from cobra.solvers import gurobi_solver
 
