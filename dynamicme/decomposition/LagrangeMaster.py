@@ -102,6 +102,7 @@ class LagrangeMaster(object):
         self.sub_dict = {}
         self.primal_dict={}
         self.ObjVal = None
+        self.Status = None
         A,B,d,csenses,xs,ys,C,b,csenses_mp,mets_d,mets_b = split_cobra(
                 cobra_model,first_stage_vars)
         self._A = A
@@ -138,6 +139,7 @@ class LagrangeMaster(object):
         self.x_dict = {}
         self.yopt = None
         self.covered_dict = {}
+        self.scale_factor = 1.
 
         self.model = self.init_model(ys)
 
@@ -335,9 +337,12 @@ class LagrangeMaster(object):
     def make_multicut(self, sub):
         """
         Make supergradient cut for subproblem k:
+        z <= sum_k wk*tk
 
-        tk <= f'yk + c'xk + 1/2 x'*Q*x + u*Hk*yk
+        tk <= f'yk + ck'xk + 1/2 x'*Q*x + u*Hk*yk
         Hk = [ny*(K-1) x ny] matrix
+
+        Note: sub._weight already account for in z <= sum_k wk*tk
         """
         tk  = self.model.getVarByName('tk_%s'%sub._id)
         fy  = sub._fy
@@ -355,7 +360,8 @@ class LagrangeMaster(object):
             vk = np.array([sub.x_dict[v.VarName] for v in sub.model.getVars()])
             quadTerm = 0.5*np.dot((Q*vk), vk)
         try:
-            cut = tk <= sum(fy*yk) + sum(cx*xk) + LinExpr(yH,us) + quadTerm
+            sc = self.scale_factor
+            cut = tk <= sc*sum(fy*yk) + sc*sum(cx*xk) + LinExpr(yH,us) + sc*quadTerm
         except GurobiError as e:
             print('Caught GurobiError (%s) in make_supercut()'%repr(e))
 
@@ -383,7 +389,7 @@ class LagrangeMaster(object):
         sub_dict = self.sub_dict
         sub_objs = []
         for sub_ind,sub in iteritems(sub_dict):
-            sub.update_obj(uk)
+            sub.update_obj(uk*self.scale_factor, self.scale_factor)
             #********************************************
             obj = sub.optimize(yk=sub.yopt) * sub._weight
             #********************************************
@@ -512,7 +518,7 @@ class LagrangeMaster(object):
             # Solve Master
             #----------------------------------------------------
             tic_master = time.time()
-            uk = self.solve_master(delta, u0)
+            zLDk, uk = self.solve_master(delta, u0)
             self.uk = uk
             toc_master = time.time()-tic_master
             if model.Status != GRB.OPTIMAL:
@@ -536,7 +542,10 @@ class LagrangeMaster(object):
                 obj = sub_result['obj']
                 if np.isnan(obj):
                     if verbosity>0:
-                        print("Relaxed subproblem %s has objval=%s."%(sub_ind, obj))
+                        print("Relaxed subproblem %s infeasible. objval=%s."%(sub_ind, obj))
+                    # Set attributes for infeasible problem
+                    self.ObjVal = 1e100
+                    self.Status = 'infeasible'
                     return None
                 else:
                     cut = sub_result['cut']
@@ -551,15 +560,32 @@ class LagrangeMaster(object):
 
             #----------------------------------------------------
             # Compute UB
-            UB = z.X        # Lagrange dual UB
-            dualUB = UB
+            #UB = z.X        # Lagrange dual UB
+            UB = zLDk
+            dualUB = zLDk #UB
             # if UB < bestUB:
             #     bestUB = UB
-            bestUB = UB     # Since proximal penalty might bias it
+            bestUB = zLDk #UB     # Since proximal penalty might bias it
+
             #----------------------------------------------------
             # Update bounds and check convergence
             # Lagrange multipliers were chosen to find the max lb
             LB = sum(sub_objs)
+
+            #************************************************
+            # DEBUG
+            # Check if weak duality not satisfied
+            if zLDk < LB-1e-5:
+                res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
+                if res_u <= 1e-9:
+                    print("Master status=%s"%(model.Status))
+                    print("Subobjs=%s"%sub_objs)
+                    print("total penalty=%s"%res_u)
+                    raise Exception("UB<LB: %s < %s"%(zLDk,LB))
+            #************************************************
+
+
+
             if LB > bestLB:
                 bestLB = LB
                 ubest  = uk     # Record best multipliers that improved LB
@@ -745,8 +771,8 @@ class LagrangeMaster(object):
                 for sub in sub_dict.values():
                     sub.model.Params.TimeLimit = time_left
 
-        if hasattr(self._z,'X'):
-            self.ObjVal = self._z.X
+        # if hasattr(self._z,'X'):
+        #     self.ObjVal = self._z.X
 
         return x_dict
 
@@ -1010,7 +1036,9 @@ class LagrangeMaster(object):
         opt_obj = sum([sub.ObjVal for sub in sub_dict.values()])
 
         if heuristic=='average':
-            ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for 
+            # ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for 
+            #     sub in sub_dict.values()])
+            ymat = np.array([[sub.x_dict[v.VarName] for v in sub._ys] for
                 sub in sub_dict.values()])
             #------------------------------------------------
             # Only need to round if not continuous
@@ -1035,7 +1063,7 @@ class LagrangeMaster(object):
             """
             Binary search to find the best rounding threshold
             """
-            ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for 
+            ymat = np.array([[sub.x_dict[v.VarName] for v in sub._ys] for 
                 sub in sub_dict.values()])
             ym = ymat.mean(axis=0)
             #------------------------------------------------
@@ -1125,7 +1153,7 @@ class LagrangeMaster(object):
                     rcs = [sub._fy + us*sub._H for sub in sub_dict.values()]
                     var_inds = {y.id:j for j,y in enumerate(self._y0)}
                     ny = len(self._y0)
-                    ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for
+                    ymat = np.array([[sub.x_dict[v.VarName] for v in sub._ys] for
                         sub in sub_dict.values()])
                     y0 = np.zeros(ny)
                     for group,vs in iteritems(self.covered_dict):
@@ -1301,7 +1329,7 @@ class LagrangeMaster(object):
         sub_dict = self.sub_dict
         result_list = []
         for sub_ind,sub in iteritems(sub_dict):
-            sub.update_obj(uk)
+            sub.update_obj(uk*self.scale_factor, self.scale_factor)
             obj = sub.optimize(yk=sub.yopt) * sub._weight
             if not np.isnan(obj):
                 cut = self.make_multicut(sub)
@@ -1315,15 +1343,22 @@ class LagrangeMaster(object):
         """
         Subclass can implement parallel version.
         """
+        #scale = self.scale_cuts # Need to unscale afterward
         model = self.model
         self.update_obj(delta, u0)
         model.optimize()
         if model.SolCount > 0:
             uk = np.array([u.X for u in self._us])
+            #if scale:
+            uk = uk/self.scale_factor
+            zLDk = self._z.X
         else:
             uk = None
+            zLDk = 1e100
 
-        return uk
+        self.ObjVal = zLDk
+
+        return zLDk, uk
 
     def update_proximal(self, uk, u0, delta, D_new, D_prox):
         """
@@ -1384,604 +1419,16 @@ class LagrangeMaster(object):
         Recover feasible primal via primal decomposition
         """
 
-
-class LagrangeMasterMPI(LagrangeMaster):
-    """
-    Solves subproblems in parallel.
-    """
-    def __init__(self,*args,**kwargs):
-        from mpi4py import MPI
-
-        self.comm = MPI.COMM_WORLD
-        self.ROOT = 0
-        self.sub_ids = []   # Need consistently ordered list of inds for parallel
-        self.uk = None      # Need to bcast
-        self.u0 = None
-        self.best_dict = {'feasUB':1e100, 'bestUB':1e100, 'bestLB':1e100,
-                'gap':1e100, 'relgap':1e100}
-        super(LagrangeMasterMPI, self).__init__(*args,**kwargs)
-
-
-    def optimize(self, feasible_methods=['heuristic','enumerate'], bundle=False,
-            multicut=True, max_alt=10, alt_method='pool', nogood_cuts=False,
-            early_heuristics=[]):
-        """ Override to implement MPI """
-        comm = self.comm
-        rank = comm.Get_rank()
-        ROOT = self.ROOT
-
+    def reset(self, kept_constrs=[]):
+        """
+        Reset problem, including dropping cuts
+        """
+        kept_constrs += ['z_cut']
         model = self.model
-
-        sub_dict_all = self.sub_dict
-        sub_ids = self.get_jobs(rank)
-        sub_dict = {k:sub_dict_all[k] for k in sub_ids}
-
-        max_iter = self.max_iter
-        print_iter = self.print_iter
-        time_limit = self.time_limit
-        gaptol = self.gaptol
-        absgaptol = self.absgaptol
-        feastol = self.feastol
-        penaltytol = self.penaltytol
-        verbosity = self.verbosity
-        delta_min = self.delta_min
-        delta_mult= self.delta_mult
-        delta = 1.
-        bundle_mult = self.bundle_mult
-        D_prox = None    # proximal point objval
-
-        if feasible_methods is None:
-            feasible_methods = []
-
-        z = self._z
-        us = self._us
-        nu = len(us)
-
-        feasUB = 1e100
-        dualUB = 1e100  # Overestimator from master, with supergradient-based polyhedral approx
-                        # Should decrease monotonically
-        UB = 1e100      # UB from feasible solution. Not necessarily monotonic, depending
-                        # method used to construct feasible solution.
-        LB = -1e100     # Underestimator from dual relaxed subproblems
-        bestLB = LB
-        bestUB = UB     # Given by best feasible solution, not the master problem
-        gap = bestUB-bestLB
-        relgap = gap/(1e-10+abs(UB))
-        uk = np.zeros(nu)
-        self.uk = uk
-        u0 = np.zeros(nu)   # Trust region center
-        self.u0 = u0
-        ubest = uk
-        x_dict = {}
-        self.log_rows = []
-
-        status_dict[GRB.SUBOPTIMAL] = 'suboptimal'
-        status_dict[GRB.NUMERIC] = 'numeric'
-
-        tic = time.time()
-        if rank==ROOT:
-            print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
-                'Iter','UB','LB','gap','relgap(%)','penalty','Time(s)'))
-            print("%8.6s%22s%22s%10.8s%10.9s%10.8s%30s" % (
-                '-'*7,'-'*19,'-'*19,'-'*9,'-'*9,'-'*9,'-'*29))
-            print("%8.6s%11.8s%11.8s%11.8s%11.8s%10.8s%10.8s%10.8s%10.8s%10.8s%10.8s" % (
-                '','Best','Feasible','Sub','Best','','','','total','master','sub'))
-
-        # Don't pool solutions until gap below tolerance
-        for sub in sub_dict.values():
-            sub.model.Params.PoolSearchMode=0
-            sub.model.Params.PoolSolutions =1
-
-        for _iter in range(max_iter):
-            #----------------------------------------------------
-            # Solve Master
-            #----------------------------------------------------
-            tic_master = time.time()
-            if rank==ROOT:
-                uk = self.solve_master(delta, u0)
-                self.uk = uk
-                if model.Status != GRB.OPTIMAL:
-                    warnings.warn("Solution available but Master solver status=%s (%s)."%(
-                        status_dict[model.Status], model.Status))
-                    if verbosity>1:
-                        print("Master solver status=%s (%s)."%(
-                            status_dict[model.Status], model.Status))
-                if uk is None:
-                    raise Exception("Master solver status=%s (%s). Aborting."%(
-                        status_dict[model.Status], model.Status))
-            else:
-                uk = np.empty(nu, dtype='float64')
-
-            toc_master = time.time()-tic_master
-            comm.Bcast(uk, root=ROOT)
-            # print("Broadcasted. rank=%s. uk=%s"%(rank,uk))
-
-            #----------------------------------------------------
-            # Solve Subproblems
-            #----------------------------------------------------
-            tic_sub = time.time()
-            sub_results = self.solve_subproblems(uk)
-            toc_sub = time.time()-tic_sub
-
-            if rank==ROOT:
-                sub_objs = []
-                for sub_result in sub_results:
-                    sub_ind = sub_result['id']
-                    obj = sub_result['obj']
-                    # print("rank=%s. obj=%s"%(rank,obj))
-                    if np.isnan(obj):
-                        if verbosity>0:
-                            print("Relaxed subproblem %s has objval=%s."%(sub_ind, obj))
-                        return None
-                    else:
-                        # cut = sub_result['cut']
-                        sub = sub_dict_all[sub_ind]
-                        x_dict =sub_result['x_dict']
-                        cut = self.make_multicut(sub, x_dict)
-                        model.addConstr(cut)
-                    sub_objs.append(obj)
-
-            if rank==ROOT:
-                #----------------------------------------------------
-                # Compute UB
-                UB = z.X        # Lagrange dual UB
-                dualUB = UB
-                # if UB < bestUB:
-                #     bestUB = UB
-                bestUB = UB     # Since proximal penalty might bias it
-                #----------------------------------------------------
-                # Update bounds and check convergence
-                LB = sum(sub_objs)
-                if LB > bestLB:
-                    bestLB = LB
-                    ubest  = uk     # Record best multipliers that improved LB
-                    self.uopt = ubest
-                    self.x_dict = {v.VarName:v.X for v in model.getVars()}
-                #----------------------------------------------------
-                # Can use Heuristics before desired gap reached
-                if early_heuristics:
-                    for heuristic in early_heuristics:
-                        yfeas, feasUBk, is_optimal = self.feasible_heuristics(heuristic)
-                        if yfeas is not None:
-                            if feasUBk < bestUB:
-                                bestUB = feasUBk
-                            if feasUBk < feasUB:
-                                feasUB = feasUBk
-                                ybest = yfeas
-                                self.yopt = ybest
-                                for j,yj in enumerate(ybest):
-                                    x_dict[sub._ys[j].VarName] = yj
-                                if verbosity>1:
-                                    print("Best Heuristic solution has objval=%s"%(feasUB))
-                                gap = abs(bestUB-bestLB)
-                                if abs(gap)<absgaptol:
-                                    gap = 0.
-                                relgap = gap/(1e-10+abs(bestUB))
-                                if relgap <= gaptol:
-                                    #--------------------------------------------
-                                    # Final QC that sum_k Hk*yk = 0
-                                    Hys = []
-                                    for sub_ind,sub in iteritems(sub_dict):
-                                        yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
-                                        Hyk = sub._H*yk
-                                        Hys.append(Hyk)
-                                    if verbosity>2:
-                                        print("sum_k Hk*yk: %s"%(sum(Hys)))
-                                        if sum([abs(x) for x in sum(Hys)]) > feastol:
-                                            print("WARNING: Non-anticipativity constraints not satisfied.")
-                                    #--------------------------------------------
-                                    # Final Log
-                                    toc = time.time()-tic
-                                    res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
-                                    self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
-                                        'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
-                                        'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-                                    break
-
-
-            # Quadratic stabilization term can cause "best" LB and UB to change
-            # non monotonically, not guaranteeing bestUB > bestLB
-            bestUB = comm.bcast(bestUB, root=ROOT)
-            bestLB = comm.bcast(bestLB, root=ROOT)
-
-            gap = abs(bestUB-bestLB)
-            if abs(gap)<absgaptol:
-                gap = 0.
-            relgap = gap/(1e-10+abs(bestUB))
-            res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
-            #------------------------------------------------
-            # Log progress
-            toc = time.time()-tic
-            if rank==ROOT:
-                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
-                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
-                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-
-            #------------------------------------------------
-            # Check convergence
-            if relgap <= gaptol and abs(res_u)<penaltytol:
-                #--------------------------------------------
-                toc = time.time()-tic
-                if verbosity>0:
-                    print(
-                    "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                    _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
-                #--------------------------------------------
-                # Now, look for a feasible solution
-                # Spend user-defined portion of total time on different strategies,
-                # including heuristics, B&B, and enumeration.
-                #--------------------------------------------
-                if feasible_methods:
-                    if 'heuristic' in feasible_methods:
-                        yfeas, feasUBk, is_optimal = self.feasible_heuristics('average')
-                        if yfeas is not None:
-                            if feasUBk < feasUB:
-                                feasUB = feasUBk
-                                ybest = yfeas
-                                self.yopt = ybest
-                                for j,yj in enumerate(ybest):
-                                    x_dict[sub._ys[j].VarName] = yj
-                                if verbosity>1:
-                                    print("Best Heuristic solution has objval=%s"%(feasUB))
-
-                            if is_optimal:
-                                #--------------------------------------------
-                                # Final QC that sum_k Hk*yk = 0
-                                Hys = []
-                                for sub_ind,sub in iteritems(sub_dict):
-                                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
-                                    Hyk = sub._H*yk
-                                    Hys.append(Hyk)
-                                if verbosity>1:
-                                    print("sum_k Hk*yk: %s"%(sum(Hys)))
-                                    if sum([abs(x) for x in sum(Hys)]) > feastol:
-                                        print("WARNING: Non-anticipativity constraints not satisfied.")
-                                #--------------------------------------------
-                                # Final Log
-                                toc = time.time()-tic
-                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
-                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
-                                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-                                break
-
-                    # Move on to the next primal recovery method
-                    if 'enumerate' in feasible_methods:
-                        yfeas, feasUBk, is_optimal = self.enum_alt_opt(first_feasible=True,
-                                max_alt=max_alt, method=alt_method, nogood_cuts=nogood_cuts)
-                        if yfeas is not None:
-                            #--------------------------------------------
-                            # Final solution candidate
-                            if feasUBk < feasUB:
-                                feasUB = feasUBk
-                                ybest = yfeas
-                                self.yopt = ybest
-                                for j,yj in enumerate(ybest):
-                                    x_dict[sub._ys[j].VarName] = yj
-                                if verbosity>1:
-                                    print("Best feasible solution has objval=%s"%(feasUB))
-
-                            if is_optimal:
-                                #--------------------------------------------
-                                # Final QC that sum_k Hk*yk = 0
-                                Hys = []
-                                for sub_ind,sub in iteritems(sub_dict):
-                                    yk = np.array([sub.x_dict[x.VarName] for x in sub._ys])
-                                    Hyk = sub._H*yk
-                                    Hys.append(Hyk)
-                                if verbosity>1:
-                                    print("sum_k Hk*yk: %s"%(sum(Hys)))
-                                    if sum([abs(x) for x in sum(Hys)]) > feastol:
-                                        print("WARNING: Non-anticipativity constraints not satisfied.")
-                                #--------------------------------------------
-                                # Final Log
-                                toc = time.time()-tic
-                                self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
-                                    'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
-                                    'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-                                break
-                        else:
-                            if verbosity>0:
-                                print("Feasible solution not among alt opt. Trying next iteration.")
-                    #--------------------------------------------
-                    # END: Recover primal feasible solution.
-                    #--------------------------------------------
-                else:
-                    break
-
-            D_new  = LB
-            if rank==ROOT:
-                u0, delta, D_prox, pred_ascent = self.update_proximal(uk, u0, delta,
-                        D_new, D_prox)
-            else:
-                u0 = np.empty(nu,'float64')
-            comm.Bcast(u0, root=ROOT)
-
-            if rank==ROOT:
-                if verbosity>2:
-                    print("pred_ascent=%s. Updating D_prox from %s to %s."%(
-                        pred_ascent,D_prox,D_new))
-
-            ascent_tol = self.feastol
-            if abs(pred_ascent) < ascent_tol:
-                toc = time.time()-tic
-                if rank==ROOT:
-                    print("Master ascent of %s < %s  below threshold. Stopping."%(
-                        pred_ascent, ascent_tol))
-                    # Final Log
-                    self.log_rows.append({'iter':_iter,'bestUB':bestUB,'feasUB':feasUB,
-                        'LB':LB,'bestLB':bestLB,'gap':gap,'relgap':relgap*100,'delta':delta,
-                        'res_u':res_u,'t_total':toc,'t_master':toc_master,'t_sub':toc_sub})
-                    if verbosity>0:
-                        print(
-                        "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                        _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
-                break
-            #------------------------------------------------
-
-            if rank==ROOT:
-                if np.mod(_iter, print_iter)==0:
-                    toc = time.time()-tic
-                    if verbosity>0:
-                        print(
-                        "%8.6s%11.4g%11.4g%11.4g%11.4g%10.4g%10.4g%10.3g%10.8s%10.8s%10.8s" % (
-                        _iter,bestUB,feasUB,LB,bestLB,gap,relgap*100,res_u,toc,toc_master,toc_sub))
-            # Check timelimit
-            toc = time.time()-tic
-            if toc > time_limit:
-                if verbosity>0:
-                    print("Stopping due to time limit of %g seconds."%time_limit)
-                break
-            else:
-                # Update time limits on all (sub)models
-                time_left = time_limit-toc
-                model.Params.TimeLimit = time_left
-                for sub in sub_dict.values():
-                    sub.model.Params.TimeLimit = time_left
-
-        return x_dict
-
-    def check_feasible_task(self, y0):
-        """ subtask """
-        sub_dict_all = self.sub_dict
-        sub_ids = self.get_jobs(rank)
-        sub_dict = {k:sub_dict_all[k] for k in sub_ids}
-        precision_sub = self.precision_sub
-
-        result_list = []
-
-        var_dict = {}     # record orig bounds for later
-        obj_dict   = {}
-        stat_dict= {}
-        feas_dict= {}
-        for sub_ind,sub in iteritems(sub_dict):
-            var_dict[sub_ind] = []
-            for j,y in enumerate(sub._ys):
-                var_dict[sub_ind].append({'LB':y.LB,'UB':y.UB,'VType':y.VType})
-                y.LB = y0[j]
-                y.UB = y0[j]
-                y.VType = GRB.CONTINUOUS    # Since fixed
-            sub.optimize()
-            stat_dict[sub_ind] = sub.model.Status
-            feas_dict[sub_ind] = sub.model.SolCount>0
-            if sub.model.SolCount>0:
-                obj = sub._weight*sub.model.ObjVal
-            else:
-                obj = np.nan
-            obj_dict[sub_ind] = obj
-
-        for sub_ind,sub in iteritems(sub_dict):
-            # Reset bounds
-            for j,y in enumerate(sub._ys):
-                y.LB = var_dict[sub_ind][j]['LB']
-                y.UB = var_dict[sub_ind][j]['UB']
-                y.VType = var_dict[sub_ind][j]['VType']
-            sub.model.update()
-
-        result_list.append({'obj_dict':obj_dict,'stat_dict':stat_dict,'feas_dict':feas_dict})
-
-        return result_list
-
-    def check_feasible(self, y0):
-        """ Override to implement MPI """
-        comm = self.comm
-        rank = comm.Get_rank()
-        ROOT = self.ROOT
-
-        results = self.check_feasible_task(y0)
-
-        result_lists = comm.gather(results, root=ROOT)
-
-        if rank==ROOT:
-            result_list = [r for l in results for r in l]
-            obj_dict = {}
-            feas_dict = {}
-            stat_dict = {}
-            for result in result_list:
-                obj_dictk = result['obj_dict']
-                stat_dictk = result['stat_dict']
-                feas_dictk = result['feas_dict']
-                for k,v in iteritems(obj_dictk):
-                    obj_dict[k] = v
-                for k,v in iteritems(stat_dictk):
-                    stat_dict[k] = v
-                for k,v in iteritems(feas_dictk):
-                    feas_dict[k] = v
-        else:
-            result_list = None
-            obj_dict = None
-            feas_dict = None
-            stat_dict = None
-
-        return obj_dict, feas_dict, stat_dict
-
-    def solve_subproblems(self, uk):
-        """ Override to implement MPI """
-        comm = self.comm
-        rank = comm.Get_rank()
-        ROOT = self.ROOT
-        # All nodes do work
-        results = self.do_work(rank, uk)
-
-        # If root, will gather results from all threads
-        result_lists = comm.gather(results, root=ROOT)
-
-        if rank==ROOT:
-            # Flatten list of lists first
-            result_list = [r for l in result_lists for r in l]
-        else:
-            result_list = None
-
-        return result_list
-
-    def solve_master(self, delta, u0):
-        """ Override to implement MPI """
-        comm = self.comm
-        rank = comm.Get_rank()
-
-        if rank==self.ROOT:
-            uk = super(LagrangeMasterMPI,self).solve_master(delta, u0)
-            self.uk = uk
-        else:
-            uk = None
-
-        return uk
-
-    def update_proximal(self, uk, u0, delta, D_new, D_prox):
-        """ Override to implement MPI """
-        comm = self.comm
-        rank = comm.Get_rank()
-
-        if rank==self.ROOT:
-            u0, delta, D_prox, pred_ascent = super(
-                    LagrangeMasterMPI,self).update_proximal(uk, u0, delta,  D_new, D_prox)
-        else:
-            pred_ascent=None
-
-        return u0, delta, D_prox, pred_ascent
-
-    def make_multicut(self, sub, x_dict):
-        """ Override to implement MPI """
-        tk  = self.model.getVarByName('tk_%s'%sub._id)
-        fy  = sub._fy
-        cx  = sub._cx
-        Hk  = sub._H
-        Q   = sub._Q
-        xk = np.array([x_dict[v.VarName] for v in sub._xs])
-        yk = np.array([x_dict[v.VarName] for v in sub._ys])
-
-        yH  = Hk*yk
-        us  = self._us
-        if Q is None:
-            quadTerm = 0.
-        else:
-            vk = np.array([x_dict[v.VarName] for v in sub.model.getVars()])
-            quadTerm = 0.5*np.dot((Q*vk), vk)
-        try:
-            cut = tk <= sum(fy*yk) + sum(cx*xk) + LinExpr(yH,us) + quadTerm
-        except GurobiError as e:
-            print('Caught GurobiError (%s) in make_supercut()'%repr(e))
-
-        return cut
-
-    def feasible_heuristics(self, sub_objs, heuristic='average'):
-        """ Override to implement MPI """
-        yfeas = None
-        feasUB = None
-        is_optimal = False
-        sub_dict = self.sub_dict
-
-        opt_obj = sum(sub_objs)
-
-        if heuristic=='average':
-            ymat = np.array([[sub._weight*sub.x_dict[v.VarName] for v in sub._ys] for 
-                sub in sub_dict.values()])
-            #------------------------------------------------
-            # Only need to round if not continuous
-            # y0 = ymat.mean(axis=0).round()
-            ym = ymat.mean(axis=0)
-            y0 = np.array(
-                    [ymi if y.VType==GRB.CONTINUOUS else ymi.round() for y,ymi in zip(sub._ys,ym)])
-            #------------------------------------------------
-            obj_dict, feas_dict, sub_stats = self.check_feasible(y0)
-
-            are_feas = feas_dict.values()
-            tot_obj = sum(obj_dict.values())
-            gap = abs(tot_obj-opt_obj)
-            relgap = abs(tot_obj-opt_obj)/(1e-10+abs(opt_obj))
-            is_optimal = gap <= self.absgaptol or relgap <= self.gaptol
-
-            if np.all(are_feas):
-                yfeas = y0
-                feasUB = tot_obj
-        else:
-            print("Unknown heuristic: %s"%heuristic)
-
-        return yfeas, feasUB, is_optimal
-
-
-
-    def do_work(self, rank, uk):
-        """
-        Do work on the subproblems assigned to this thread.
-        """
-        sub_dict_all = self.sub_dict
-
-        sub_ids = self.get_jobs(rank)
-        sub_dict = {k:sub_dict_all[k] for k in sub_ids}
-
-        result_list = []
-        for sub_ind,sub in iteritems(sub_dict):
-            sub.update_obj(uk)
-            obj = sub.optimize(yk=sub.yopt) * sub._weight
-            # if not np.isnan(obj):
-            #     cut = self.make_multicut(sub)
-            # else:
-            #     cut = None
-            # result_list.append({'id':sub_ind, 'obj':obj, 'cut':cut})
-            x_dict = sub.x_dict
-            result_list.append({'id':sub_ind, 'obj':obj, 'x_dict':x_dict})
-
-        return result_list
-
-    def add_submodels(self, sub_dict, **kwargs):
-        """
-        Override to update list of submodel ids and jobs.
-        """
-        for sub_id in sub_dict.keys():
-            self.sub_ids.append(sub_id)
-
-        comm = self.comm
-        size = comm.Get_size()
-        self.worker_tasks = self.get_joblist(self.sub_ids, size)
-
-        super(LagrangeMasterMPI, self).add_submodels(sub_dict, **kwargs)
-        nu = len(self._us)
-        self.uk = np.zeros(nu)
-
-    def get_joblist(self, ids_all, n_workers):
-        #------------------------------------------------------------
-        # Split the work
-        n_tasks = len(ids_all)
-        tasks_per_worker = n_tasks/n_workers
-        rem = n_tasks - tasks_per_worker * n_workers
-        # Distributes remainder across workers
-        worker_sizes = np.array(
-                [tasks_per_worker + (1 if i<rem else 0) for i in range(0,n_workers)],'i')
-        #------------------------------------------------------------
-        # Thus, worker_tasks[rank] gives the actual indices to work on
-        inds_end = np.cumsum(worker_sizes)
-        inds_start = np.hstack( (0, inds_end[0:-1]) )
-        worker_tasks = [ids_all[inds_start[i]:inds_end[i]] for i in range(0,n_workers)]
-
-        return worker_tasks
-
-    def get_jobs(self, rank):
-        """
-        Distribute submodels according to rank
-        """
-        worker_tasks = self.worker_tasks
-
-        return worker_tasks[rank]
+        for cons in model.getConstrs():
+            if cons.ConstrName not in kept_constrs:
+                model.remove(cons)
+        model.update()
 
 
 def binary_thresh(x, thresh):

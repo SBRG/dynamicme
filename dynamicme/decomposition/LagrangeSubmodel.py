@@ -139,7 +139,7 @@ class LagrangeSubmodel(object):
 
         return model
 
-    def update_obj(self, uk):
+    def update_obj(self, uk, scaling=1.):
         """
         min  f'yk + c'xk + uk'*Hk*yk + 1/2 x'*Q*x
         """
@@ -153,7 +153,7 @@ class LagrangeSubmodel(object):
         uH = uk*Hk
 
         model = self.model
-        obj_lin = LinExpr(fy,ys) + LinExpr(cx,xs) + LinExpr(uH,ys)
+        obj_lin = scaling*LinExpr(fy,ys) + scaling*LinExpr(cx,xs) + LinExpr(uH,ys)
         if Q is None:
             obj_fun = obj_lin
         else:
@@ -163,7 +163,7 @@ class LagrangeSubmodel(object):
                 x0 = var_dict[ind0]
                 x1 = var_dict[ind1]
                 obj_quad.addTerms(val/2., x0, x1)
-            obj_fun = obj_lin + obj_quad
+            obj_fun = obj_lin + scaling*obj_quad
 
         model.setObjective(obj_fun, GRB.MINIMIZE)
         model.update()

@@ -34,12 +34,16 @@ class ProblemNode(object):
         self.parent  = parent
         self.value   = None
         self.bound_dict = {}
+        self.verbosity = 0
 
     def optimize(self, *args, **kwargs):
         """
         Recursively implement all problem modifications of parent-parent...
         Finally solve modified problem.
         """
+        # Reset bounds
+        self.reset_problem()
+
         # Inherit changes to problem including this node
         self.inherit_changes()
 
@@ -52,13 +56,18 @@ class ProblemNode(object):
 
         return sol
 
-    def update_problem(self):
+    def update_problem(self, exclude_list=[]):
         problem = self.problem
-        for sub in problem.sub_dict.values():
-            for k,(lb,ub) in iteritems(self.bound_dict):
-                v = sub.model.getVarByName(k)
-                v.LB = lb
-                v.UB = ub
+        for k,(lb,ub) in iteritems(self.bound_dict):
+            if k not in exclude_list:
+                for sub in problem.sub_dict.values():
+                    v = sub.model.getVarByName(k)
+                    v.LB = lb
+                    v.UB = ub
+                    sub.model.update()
+                    if self.verbosity>0:
+                        print("sub=%s. k=%s. lb=%s. ub=%s"%(sub._id,k,lb,ub))
+
 
     def reset_problem(self):
         problem = self.problem
@@ -67,19 +76,44 @@ class ProblemNode(object):
                 v = sub.model.getVarByName(y.id)
                 v.LB = y.lower_bound
                 v.UB = y.upper_bound
+                sub.model.update()
+
+    def get_changelist(self, changelist):
+        """
+        Get change list. Should implemnt changes in reverse order.
+        First call should provide changelist=[]
+        """
+        changelist.append(self.bound_dict)
+        if self.parent is not None:
+            changelist = self.parent.get_changelist(changelist)
+
+        return changelist
+
 
     def inherit_changes(self):
         """
         Recursively inherit changes from parent
         """
-        # Reset bounds
-        self.reset_problem()
+        changelist = self.get_changelist([])
+        # Implement parent changes first,
+        # since children may overwrite them.
+        problem = self.problem
+        for c in reversed(changelist):
+            for k,vs in iteritems(c):
+                for sub in problem.sub_dict.values():
+                    v = sub.model.getVarByName(k)
+                    v.LB = vs[0]
+                    v.UB = vs[1]
+                    sub.model.update()
 
         # Inherit all changes along this node lineage
-        self.update_problem()
-        parent = self.parent
-        if parent is not None:
-            parent.inherit_changes()
+        # self.update_problem(exclude_list)
+        # exclude_list += self.bound_dict.keys()
+        # print("exclude_list=%s"%exclude_list)
+        # parent = self.parent
+        # if parent is not None:
+        #     print("inheriting changes from parent=%s"%parent)
+        #     parent.inherit_changes(exclude_list=exclude_list)
 
     @property
     def feasible(self):
