@@ -45,6 +45,7 @@ class LagrangeBB(object):
         self.verbosity = 1
         self.node_verbosity = 0
         self.sol_best = None
+        self.branch_rule = 'dispersion'
 
     def optimize(self, *args, **kwargs):
         """
@@ -116,7 +117,7 @@ class LagrangeBB(object):
                     print("%d NODES DROPPED BY PRUNING: z > %g"%(n_dropped, feasUB))
 
                 # Branch and add problems
-                children = self.branch(node)
+                children = self.branch(node, rule=self.branch_rule)
                 if children:
                     tree.add(children)
 
@@ -134,6 +135,21 @@ class LagrangeBB(object):
 
         return incons
 
+    def calc_reduced_costs(self, master):
+        """
+        Calculate reduced cost of each y: fj + (u'H)j
+        """
+        sub_dict = master.sub_dict
+        uk = master.uopt
+        rc_mat = np.array([sub._weight*(sub._fy + uk*sub._H) for
+            sub in sub_dict.values()])
+        rcs = rc_mat.sum(axis=0)
+        # If already consistent, set cost to zero
+        incons = self.calc_inconsistency(master)
+        rcs[abs(incons)<=ZERO] = 0
+
+        return rcs
+
 
     def branch(self, node, rule="dispersion"):
         """
@@ -144,47 +160,81 @@ class LagrangeBB(object):
         problem = node.problem
         verbosity = self.verbosity
         # Choose branching variable
+        ind = None
         children = []
         if rule=='dispersion':
-            #Hy = self.calc_inconsistency(problem)
-            #max_disp = max(abs(Hy))
             incons = self.calc_inconsistency(problem)
-            max_disp = max(incons)
-            if max_disp > ZERO:
+            branch_val = max(incons)
+            if branch_val > ZERO:
                 #ind = np.where(Hy==max_disp)[0][0]
-                ind = np.where(incons==max_disp)[0][0]
+                ind = np.where(incons==branch_val)[0][0]
                 yval = problem.yopt[ind]
-                if verbosity>0:
-                    print("y[%d] = %s"%(ind,yval))
+        elif rule=='dispersion_random':
+            """ Break ties by random permutation """
+            incons = self.calc_inconsistency(problem)
+            branch_val = max(incons)
+            if branch_val > ZERO:
+                inds = np.where(incons==branch_val)[0]
+                ind  = np.random.permutation(inds)[0]
+                yval = problem.yopt[ind]
 
-                yj = problem._y0[ind]
-                #yl = yj.lower_bound     # Unchanged
-                #yu = yj.upper_bound     # Unchanged
-                if node.bound_dict.has_key(yj.id):
-                    yl,yu = node.bound_dict[yj.id]
+        elif rule in ['min_cost','max_cost']:
+            incons = self.calc_reduced_costs(problem)
+            if max(abs(incons)) > ZERO:
+                if rule=='min_cost':
+                    branch_val = min(incons)
+                    if branch_val == 0:
+                        branch_val = max(abs(incons))
+                        ind = np.where(abs(incons)==branch_val)[0][0]
+                    else:
+                        ind = np.where(incons==branch_val)[0][0]
                 else:
-                    yl = yj.lower_bound
-                    yu = yj.upper_bound
-
-                if yu <= 1:
-                    # If binary
-                    child0 = ProblemNode(problem, parent=node)
-                    child0.bound_dict = {yj.id:(yl, 0)}
-                    child1 = ProblemNode(problem, parent=node)
-                    child1.bound_dict = {yj.id:(1, yu)}
-                    children.append(child0)
-                    children.append(child1)
-                else:
-                    # Just integer
-                    child0 = ProblemNode(problem, parent=node)
-                    child0.bound_dict = {yj.id:(yl, yval)}
-                    child1 = ProblemNode(problem, parent=node)
-                    child1.bound_dict = {yj.id:(yval+1, yu)}
-                    children.append(child0)
-                    children.append(child1)
-                if verbosity>0:
-                    print("BRANCHING ON y[%d]: %s"%(ind,yj.id))
+                    branch_val = max(incons)
+                    if branch_val == 0:
+                        branch_val = max(abs(incons))
+                        ind = np.where(abs(incons)==branch_val)[0][0]
+                    else:
+                        ind = np.where(incons==branch_val)[0][0]
+                yval = problem.yopt[ind]
         else:
-            raise ValueError("Unknown branching rule: %s"%rule)
+            raise Exception("Unknown rule=%s"%rule)
+
+        if ind is not None:
+            yval = problem.yopt[ind]
+            if verbosity>0:
+                print("y[%d] = %s"%(ind,yval))
+
+            yj = problem._y0[ind]
+            if node.bound_dict.has_key(yj.id):
+                yl,yu = node.bound_dict[yj.id]
+            else:
+                yl = yj.lower_bound
+                yu = yj.upper_bound
+
+            if yu <= 1:
+                # If binary
+                yl0 = yl
+                yu0 = 0.
+                yl1 = 1.
+                yu1 = yu
+            else:
+                # Just integer
+                yl0 = yl
+                yu0 = yval
+                yl1 = yval+1
+                yu1 = yu
+
+            child0 = ProblemNode(problem, parent=node)
+            child0.bound_dict = {yj.id:(yl0, yu0)}
+            child1 = ProblemNode(problem, parent=node)
+            child1.bound_dict = {yj.id:(yl1, yu1)}
+            children.append(child0)
+            children.append(child1)
+
+            if verbosity>0:
+                print("BRANCHING ON y[%d]: %s with dispersion(cost)=%s in [%s, %s]"%(
+                    ind,yj.id, branch_val, min(incons), max(incons)))
+                print("Child0: [%s, %s], Child1: [%s, %s]"%(
+                    yl0,yu0, yl1,yu1))
 
         return children

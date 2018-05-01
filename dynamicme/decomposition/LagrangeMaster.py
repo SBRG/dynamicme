@@ -577,11 +577,13 @@ class LagrangeMaster(object):
             # Check if weak duality not satisfied
             if zLDk < LB-1e-5:
                 res_u = delta/2.*sum((uk-u0)**2)    # total penalty term
-                if res_u <= 1e-9:
+                if res_u <= 1e-12:
                     print("Master status=%s"%(model.Status))
                     print("Subobjs=%s"%sub_objs)
                     print("total penalty=%s"%res_u)
-                    raise Exception("UB<LB: %s < %s"%(zLDk,LB))
+                    #raise Exception("UB<LB: %s < %s"%(zLDk,LB))
+                    print("UB<LB: %s < %s"%(zLDk,LB))
+                    warnings.warn("UB<LB: %s < %s"%(zLDk,LB))
             #************************************************
 
 
