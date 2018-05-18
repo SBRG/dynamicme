@@ -416,7 +416,9 @@ class DynamicME(object):
                   'rxn_flux':rxn_flux_profile,
                   'time':times,
                   'basis':basis,
-                  'prot_concs':prot_concs}
+                  'complex':cplx_profile
+                  }
+                  #'prot_concs':prot_concs}
 
         self.result = result
 
