@@ -12,9 +12,9 @@
 #
 # 05 Oct 2017:  migrated to separate file
 #============================================================
-from cobrame import StoichiometricData, ComplexData, ProcessData, SubreactionData
+from cobrame import StoichiometricData, ComplexData, SubreactionData
 from cobrame import MEReaction
-from cobrame import DictList
+from cobra import DictList
 from cobrame import mu
 
 from six import iteritems, string_types
