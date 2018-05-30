@@ -22,12 +22,10 @@ from cobrame import MetabolicReaction, TranslationReaction, MEReaction
 from cobrame import MEModel
 from cobrame import Complex, ComplexFormation, GenericFormationReaction
 
-from qminos.qnonlinme import ME_NLP
-from qminos.me1 import ME_NLP1
+from qminospy.me1 import ME_NLP1
 
 from dynamicme.model import ComplexDegradation, PeptideDegradation
 
-from cobrawe.me1tools import ME1tools
 from sympy import Basic
 
 import sympy
@@ -71,26 +69,15 @@ class DynamicME(object):
     """
 
     def __init__(self, me, growth_key='mu', growth_rxn='biomass_dilution',
-                 nlp_compat=False, exchange_one_rxn=None):
+                 exchange_one_rxn=None):
         self.me = me
-        self.nlp_compat = nlp_compat
         is_me2 = isinstance(me, MEModel)
         if exchange_one_rxn is None:
             exchange_one_rxn = is_me2
         self.exchange_one_rxn = exchange_one_rxn
 
-        if isinstance(me, MEModel):
-            if nlp_compat:
-                self.solver = ME_NLP(me, growth_key=growth_key, growth_rxn=growth_rxn)
-            else:
-                self.solver = ME_NLP1(me, growth_key=growth_key)
-            self.growth_rxn = growth_rxn
-        else:
-            self.solver = ME_NLP1(me)
-            self.growth_rxn = self.solver.growth_key
-            if not hasattr(me,'translation_data'):
-                me1tools = ME1tools(me)
-                me1tools.make_translation_data()
+        self.solver = ME_NLP1(me, growth_key=growth_key)
+        self.growth_rxn = growth_rxn
         self.me_nlp = self.solver   # for backward compat
 
         self.mm_model = None    # Used for proteome-constrained sub simulation
@@ -111,7 +98,6 @@ class DynamicME(object):
                        cplx_conc_dict0={},
                        mm_model = None,
                        basis=None,
-                       no_nlp=False,
                        verbosity=2,
                        LB_DEFAULT=-1000.,
                        UB_DEFAULT=1000.,
@@ -256,20 +242,8 @@ class DynamicME(object):
                 # Compute ME
                 if verbosity >= 1:
                     print 'Computing new uptake rates'
-                if self.nlp_compat:
-                    if no_nlp:
-                        mu_opt, hs_bs, x_opt, cache_opt = solver.bisectmu(prec_bs, basis=basis,
-                                                                          verbosity=verbosity)
-                    else:
-                        x_opt, stat, hs_bs = solver.solvenlp(prec_bs, basis=basis)
-                        cache_opt = None
-                    if me.solution is None:
-                        mu_opt = 0.
-                    else:
-                        mu_opt = me.solution.f
-                else:
-                    mu_opt, hs_bs, x_opt, cache_opt = solver.bisectmu(prec_bs, basis=basis,
-                                                                      verbosity=verbosity)
+                mu_opt, hs_bs, x_opt, cache_opt = solver.bisectmu(prec_bs, basis=basis,
+                                                                  verbosity=verbosity)
 
                 if proteome_has_inertia:
                     raise Exception("Not yet implemented.")
@@ -463,7 +437,6 @@ class DynamicME(object):
                        proteome_has_inertia=False,
                        mm_model = None,
                        basis=None,
-                       no_nlp=False,
                        verbosity=2,
                        solver_verbosity=0,
                        LB_DEFAULT=-1000.,
@@ -836,11 +809,9 @@ class ParallelMove(object):
         mover.move(me, pert_rxns, group_rxn_dict=group_rxn_dict)
 
         # Simulate
-        dyme = DynamicME(me, nlp_compat=nlp_compat,
-                         growth_key=growth_key, growth_rxn=growth_rxn,
+        dyme = DynamicME(me, growth_key=growth_key, growth_rxn=growth_rxn,
                          exchange_one_rxn=self.exchange_one_rxn)
-        result = self.simulate_batch(dyme, basis=basis, no_nlp=no_nlp,
-                                     verbosity=verbosity)
+        result = self.simulate_batch(dyme, basis=basis, verbosity=verbosity)
 
         # Compute objective value (error)
         df_sim = self.compute_conc_profile(result)
@@ -927,9 +898,7 @@ class ParamOpt(object):
                     max_iter_phase1=10,
                     max_iter_phase2=100,
                     max_reject = 10,
-                    nlp_compat=False,
                     group_rxn_dict=None,
-                    no_nlp=False,
                     verbosity=2,
                     error_fun=None):
         """
@@ -984,14 +953,12 @@ class ParamOpt(object):
         me = self.me
         growth_key = self.growth_key
         growth_rxn = self.growth_rxn
-        dyme = DynamicME(me, nlp_compat=nlp_compat,
-                         growth_key=growth_key, growth_rxn=growth_rxn,
+        dyme = DynamicME(me, growth_key=growth_key, growth_rxn=growth_rxn,
                          exchange_one_rxn=self.exchange_one_rxn)
 
         # Get initial solution
         if result0 is None:
-            result0 = self.simulate_batch(dyme, basis=basis, no_nlp=no_nlp,
-                                          verbosity=verbosity)
+            result0 = self.simulate_batch(dyme, basis=basis, verbosity=verbosity)
         df_sim0 = self.compute_conc_profile(result0)
         objval0 = self.calc_error_conc(df_sim0, df_meas, variables, error_fun=error_fun)
 
@@ -1018,11 +985,9 @@ class ParamOpt(object):
                 mover.move(me, pert_rxns, group_rxn_dict=group_rxn_dict)
 
                 # Simulate
-                dyme = DynamicME(me, nlp_compat=nlp_compat,
-                                 growth_key=growth_key, growth_rxn=growth_rxn,
+                dyme = DynamicME(me, growth_key=growth_key, growth_rxn=growth_rxn,
                                  exchange_one_rxn=self.exchange_one_rxn)
-                result = self.simulate_batch(dyme, basis=basis, no_nlp=no_nlp,
-                                             verbosity=verbosity)
+                result = self.simulate_batch(dyme, basis=basis, verbosity=verbosity)
                 # Unmove: generate samples surrounding initial point
                 # TODO: PARALLEL unmoves
                 mover.unmove(me)
@@ -1075,11 +1040,9 @@ class ParamOpt(object):
                 mover.move(me, pert_rxns, group_rxn_dict=group_rxn_dict)
 
                 # Simulate
-                dyme = DynamicME(me, nlp_compat=nlp_compat,
-                                 growth_key=growth_key, growth_rxn=growth_rxn,
+                dyme = DynamicME(me, growth_key=growth_key, growth_rxn=growth_rxn,
                                  exchange_one_rxn=self.exchange_one_rxn)
-                result = self.simulate_batch(dyme, basis=basis, no_nlp=no_nlp,
-                                             verbosity=verbosity)
+                result = self.simulate_batch(dyme, basis=basis, verbosity=verbosity)
 
                 # Compute objective value (error)
                 df_sim = self.compute_conc_profile(result)
@@ -1124,8 +1087,7 @@ class ParamOpt(object):
         return sol_best, opt_stats, result_best
 
 
-    def simulate_batch(self, dyme, basis=None, prec_bs=1e-3, no_nlp=False,
-                       verbosity=2):
+    def simulate_batch(self, dyme, basis=None, prec_bs=1e-3, verbosity=2):
         """
         Compute error in concentration profile given params
 
@@ -1152,7 +1114,6 @@ class ParamOpt(object):
                                      extra_rxns_tracked=extra_rxns_tracked,
                                      lb_dict=lb_dict,
                                      ub_dict=ub_dict,
-                                     no_nlp=no_nlp,
                                      verbosity=verbosity)
         self.result = result
         return result
