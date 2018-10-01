@@ -2,6 +2,9 @@
 # File dynamic.py
 #
 # class  DynamicME
+#
+# class  LocalMove
+# class  ParallelMove
 # class  ParamOpt
 #
 # Class & methods for dynamic FBA with ME models.
@@ -141,6 +144,15 @@ class DynamicME(object):
         exchange_one_rxn = self.exchange_one_rxn
 
         # If constraining proteome "inertia" need extra constraints
+        if len(cplx_conc_dict0) > 0:
+            cplxs = [me.metabolites.get_by_id(k) for k in cplx_conc_dict0.keys()]
+            try:
+                cplx_concs = get_cplx_concs(solver, cplxs=cplxs, undiluted_cplxs=[])
+                assert len(cplx_concs.keys()) == len(cplxs)
+            except Exception as e:
+                print("Test to get cplx concs failed! Exiting now.")
+                raise Exception(e)
+
         cplx_conc_dict = dict(cplx_conc_dict0)
         if proteome_has_inertia:
             # Initial proteome availability should be unconstrained
@@ -153,7 +165,8 @@ class DynamicME(object):
         mu_opt = 0.
         x_dict = None
         if exchange_one_rxn:
-            ex_flux_dict = {self.get_exchange_rxn(metid).id:0. for metid in conc_dict.keys()}
+            ex_flux_dict = {self.get_exchange_rxn(metid, exchange_one_rxn=exchange_one_rxn).id:0.
+                    for metid in conc_dict.keys()}
         else:
             ex_flux_dict = {}
             for metid in conc_dict.keys():
@@ -266,7 +279,7 @@ class DynamicME(object):
                 v = 0.
                 # If ME 1.0, EX_ split into source and sink
                 if exchange_one_rxn:
-                    rxn = self.get_exchange_rxn(metid)
+                    rxn = self.get_exchange_rxn(metid, exchange_one_rxn=exchange_one_rxn)
                     if x_dict is not None:
                         v = me.solution.x_dict[rxn.id]              # mmol/gDW/h
                     ex_flux_dict[rxn.id] = v
@@ -313,19 +326,29 @@ class DynamicME(object):
             #------------------------------------------------
             """
             for a cell:
-                Ej(t+1) = Ej(t) + v_formation*dt
+                Ej(t+1) = Ej(t) + (v_formation - v_dilution)*dt
                 mmol/gDW = mmol/gDW + mmol/gDW/h * h
             """
-            for cplx_id, conc in iteritems(cplx_conc_dict):
-                cplx = me.metabolites.get_by_id(cplx_id)
-                #data = me.complex_data.get_by_id(cplx_id)
-                #data.formation
-                v_cplx_net = 0.
-                #for rxn in cplx.reactions:
+            if len(cplx_conc_dict0)>0:
+                # Just all cplxs tracked
+                if me.solution is not None:
+                    cplx_concs = get_cplx_concs(solver, cplxs=cplxs, undiluted_cplxs=[])
+                    cplx_conc_dict_prime = dict(cplx_concs)
+                else:
+                    # Just pass the previous time step.
+                    # Or can return empty.
+                    cplx_conc_dict_prime = {} 
 
+            #for cplx_id, conc in iteritems(cplx_conc_dict):
+            #    cplx = me.metabolites.get_by_id(cplx_id)
+            #    #data = me.complex_data.get_by_id(cplx_id)
+            #    #data.formation
+            #    #v_cplx_net = 0.
 
-                v_formation = me.solution.x_dict[rxn_form.id]
-                cplx_conc_dict_prime[cplx_id] = conc + v_cplx_net*dt
+            #    #formation = me.reactions.get_by_id('formation_'+cplx_id)
+
+            #    #v_formation = me.solution.x_dict[rxn_form.id]
+            #    #cplx_conc_dict_prime[cplx_id] = conc + v_cplx_net*dt
 
 
             # Reset the run if the reset_run flag is triggered, if not update the new biomass and conc_dict
@@ -898,7 +921,9 @@ class ParamOpt(object):
                     max_iter_phase1=10,
                     max_iter_phase2=100,
                     max_reject = 10,
+                    nlp_compat=False,
                     group_rxn_dict=None,
+                    no_nlp=False,
                     verbosity=2,
                     error_fun=None):
         """
@@ -953,12 +978,14 @@ class ParamOpt(object):
         me = self.me
         growth_key = self.growth_key
         growth_rxn = self.growth_rxn
-        dyme = DynamicME(me, growth_key=growth_key, growth_rxn=growth_rxn,
+        dyme = DynamicME(me, nlp_compat=nlp_compat,
+                         growth_key=growth_key, growth_rxn=growth_rxn,
                          exchange_one_rxn=self.exchange_one_rxn)
 
         # Get initial solution
         if result0 is None:
-            result0 = self.simulate_batch(dyme, basis=basis, verbosity=verbosity)
+            result0 = self.simulate_batch(dyme, basis=basis, no_nlp=no_nlp,
+                                          verbosity=verbosity)
         df_sim0 = self.compute_conc_profile(result0)
         objval0 = self.calc_error_conc(df_sim0, df_meas, variables, error_fun=error_fun)
 
@@ -985,9 +1012,11 @@ class ParamOpt(object):
                 mover.move(me, pert_rxns, group_rxn_dict=group_rxn_dict)
 
                 # Simulate
-                dyme = DynamicME(me, growth_key=growth_key, growth_rxn=growth_rxn,
+                dyme = DynamicME(me, nlp_compat=nlp_compat,
+                                 growth_key=growth_key, growth_rxn=growth_rxn,
                                  exchange_one_rxn=self.exchange_one_rxn)
-                result = self.simulate_batch(dyme, basis=basis, verbosity=verbosity)
+                result = self.simulate_batch(dyme, basis=basis, no_nlp=no_nlp,
+                                             verbosity=verbosity)
                 # Unmove: generate samples surrounding initial point
                 # TODO: PARALLEL unmoves
                 mover.unmove(me)
@@ -1040,9 +1069,11 @@ class ParamOpt(object):
                 mover.move(me, pert_rxns, group_rxn_dict=group_rxn_dict)
 
                 # Simulate
-                dyme = DynamicME(me, growth_key=growth_key, growth_rxn=growth_rxn,
+                dyme = DynamicME(me, nlp_compat=nlp_compat,
+                                 growth_key=growth_key, growth_rxn=growth_rxn,
                                  exchange_one_rxn=self.exchange_one_rxn)
-                result = self.simulate_batch(dyme, basis=basis, verbosity=verbosity)
+                result = self.simulate_batch(dyme, basis=basis, no_nlp=no_nlp,
+                                             verbosity=verbosity)
 
                 # Compute objective value (error)
                 df_sim = self.compute_conc_profile(result)
@@ -1087,7 +1118,8 @@ class ParamOpt(object):
         return sol_best, opt_stats, result_best
 
 
-    def simulate_batch(self, dyme, basis=None, prec_bs=1e-3, verbosity=2):
+    def simulate_batch(self, dyme, basis=None, prec_bs=1e-3, no_nlp=False,
+                       verbosity=2):
         """
         Compute error in concentration profile given params
 
@@ -1114,6 +1146,7 @@ class ParamOpt(object):
                                      extra_rxns_tracked=extra_rxns_tracked,
                                      lb_dict=lb_dict,
                                      ub_dict=ub_dict,
+                                     no_nlp=no_nlp,
                                      verbosity=verbosity)
         self.result = result
         return result
@@ -1197,6 +1230,12 @@ class ParamOpt(object):
         error_tot = sum(weighted_errors)
         return error_tot
 
+
+    def fit_profile_abc(self):
+        """
+        Tune parameters (e.g., keffs) to fit flux or conc profile
+        """
+
     def compute_proteome_profile(self, result, rxns_trsl):
         """
         df_prot = compute_proteome_profile(result, rxns_trsl) 
@@ -1253,7 +1292,8 @@ def get_exchange_rxn(me, metid, direction='both', exchange_one_rxn=None):
 
 
 def get_undiluted_cplxs(solver, exclude_types=[
-    ComplexFormation, GenericFormationReaction, ComplexDegradation, PeptideDegradation]):
+    ComplexFormation, GenericFormationReaction, ComplexDegradation, PeptideDegradation],
+    complex_data = None):
     """
     Find cplxs that are not diluted
 
@@ -1262,7 +1302,10 @@ def get_undiluted_cplxs(solver, exclude_types=[
     """
     me = solver.me
     undiluted_cplxs = []
-    for data in me.complex_data:
+    if complex_data is None:
+        complex_data = me.complex_data
+
+    for data in complex_data:
         met = data.complex
         for rxn in met.reactions:
             if not any([isinstance(rxn,t) for t in exclude_types]):
@@ -1279,7 +1322,7 @@ def get_undiluted_cplxs(solver, exclude_types=[
 
 
 def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', undiluted_cplxs=None,
-        ZERO=1e-20):
+        ZERO=1e-20, cplxs=None):
     """
     Get complex concentrations (mmol/gDW) from solution:
     [E_i] = sum_j v_j / keff_ij
@@ -1287,7 +1330,15 @@ def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', undiluted_
     undiluted_cplxs: skip the complexes that are not diluted--i.e.,. treated as metabolites
     """
     me = solver.me
-    x_dict = me.solution.x_dict
+    #--------------------------------------------------------
+    # Was the model solved and feasible?
+    if me.solution is not None:
+        x_dict = me.solution.x_dict
+    else:
+        warnings.warn('get_cplx_concs: Model has no solution!')
+        return None
+    #--------------------------------------------------------
+
     if muopt is None:
         #muopt = solver.substitution_dict['mu']
         muopt = x_dict[growth_rxn]
@@ -1297,7 +1348,8 @@ def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', undiluted_
 
     solver.substitution_dict['mu'] = muopt
     sub_vals = [solver.substitution_dict[k] for k in solver.subs_keys_ordered]
-    cplxs = [data.complex for data in me.complex_data if data not in undiluted_cplxs]
+    if cplxs is None:
+        cplxs = [data.complex for data in me.complex_data if data not in undiluted_cplxs]
 
     cplx_conc_dict = {}
     for cplx in cplxs:
@@ -1306,11 +1358,15 @@ def get_cplx_concs(solver, muopt=None, growth_rxn='biomass_dilution', undiluted_
         concs = []
         for rxn in cplx.reactions:
             stoich = rxn.metabolites[cplx]
-            if stoich<0 and hasattr(stoich,'free_symbols') and mu in stoich.free_symbols:
-                ci = stoich.coeff(mu)
-                if not ci.free_symbols:
-                    conci = x_dict[rxn.id] * -float(ci)
-                    concs.append(conci)
+            try:
+                if stoich<0 and hasattr(stoich,'free_symbols') and mu in stoich.free_symbols:
+                    ci = stoich.coeff(mu)
+                    if not ci.free_symbols:
+                        conci = x_dict[rxn.id] * -float(ci)
+                        concs.append(conci)
+            except:
+                warnings.warn('get_cplx_cons: problem with cplx %s and rxn %s'%(
+                    cplx.id, rxn.id))
         conc = sum(concs)
         if conc < ZERO:
             conc = 0
