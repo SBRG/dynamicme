@@ -21,4 +21,4 @@ COBRAme compatible with the latest backend updates that were made in COBRApy aft
 
 ## Citing:
 If you find the module useful, please consider citing:
-- [Yang et al. (2018) bioRxiv. doi:10.1101/319962](https://www.biorxiv.org/content/early/2018/05/15/319962)
+- [L Yang, A Ebrahim, CJ Lloyd, MA Saunders, BO Palsson (2019). DynamicME: dynamic simulation and refinement of integrated models of metabolism and protein expression. BMC Systems Biology 13:2. doi: 10.1186/s12918-018-0675-6.](https://doi.org/10.1186/s12918-018-0675-6)
